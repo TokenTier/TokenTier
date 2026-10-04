@@ -1,0 +1,18 @@
+{
+  "project": "/Users/someone/code/demo-app",
+  "lead": "SONNET 5.5",
+  "models": {"haiku": "HAIKU 4.5", "sonnet": "SONNET 5.5", "opus": "OPUS 5.5"},
+  "sessions": [
+    {"id": "2026-09-30", "date": "2026-09-30", "summary": {"total_tasks": 3},
+     "tasks": [
+       {"id": "t1", "label": "Lint", "detail": "run lint", "app": "web", "tier": "haiku", "status": "pass", "tokens": 1200, "opus_est_tokens": 1800, "duration_ms": 60000, "result": "ok"},
+       {"id": "t2", "label": "Plan", "detail": "inline", "app": "all", "tier": "lead", "status": "pass", "tokens": 0, "opus_est_tokens": 5000, "duration_ms": 0, "result": "planned"},
+       {"id": "t3", "label": "Fix bug", "detail": "auth", "app": "api", "tier": "mid", "status": "fixed", "tokens": 50000, "opus_est_tokens": 75000, "duration_ms": 300000, "result": "fixed after retry"}
+     ]},
+    {"id": "2026-10-01", "date": "2026-10-01",
+     "tasks": [
+       {"id": "t1", "label": "Refactor", "detail": "big", "app": "api", "tier": "opus", "status": "fail", "tokens": 90000, "opus_est_tokens": 90000, "duration_ms": 600000, "result": "blocked"},
+       {"id": "t2", "label": "Still going", "detail": "", "app": "api", "tier": "opus", "status": "running", "tokens": 0, "opus_est_tokens": 0, "duration_ms": 0, "result": ""}
+     ]}
+  ]
+}

@@ -1,0 +1,39 @@
+# Private planning notes and personal data (never publish)
+plan.md
+legacy-data/
+.env
+.env.*
+*.local
+.claude/settings.local.json
+.claude/projects/
+
+# TokenTier runtime files (live in ~/.tokentier, but keep them out if a dev points TOKENTIER_HOME here)
+.tokentier/
+state/
+routing-hints.json
+install-manifest.json
+hook-errors.log
+hook-ignored.log
+dashboard.log
+*.log
+
+# Python / Node
+__pycache__/
+*.pyc
+.venv/
+venv/
+node_modules/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editors, OS and scratch files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.tmp
+*.bak

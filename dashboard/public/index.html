@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>TokenTier</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='4' y='19' width='24' height='7' rx='3.5' fill='%233dd9a0'/%3E%3Crect x='7' y='11.5' width='18' height='6' rx='3' fill='%2345c3f5'/%3E%3Crect x='10' y='5' width='12' height='5' rx='2.5' fill='%23c69cff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<a class="skip" href="#feed-h">Skip to task list</a>
+
+<header class="hdr">
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 32 32" width="32" height="32" aria-hidden="true" focusable="false">
+      <rect x="4" y="19" width="24" height="7" rx="3.5" class="lg-h"/>
+      <rect x="7" y="11.5" width="18" height="6" rx="3" class="lg-s"/>
+      <rect x="10" y="5" width="12" height="5" rx="2.5" class="lg-o"/>
+    </svg>
+    <div class="brand-t">
+      <h1>TokenTier</h1>
+      <span class="brand-sub">Router dashboard</span>
+    </div>
+  </div>
+
+  <div class="controls">
+    <label class="field">
+      <span class="field-l">Project</span>
+      <select id="project"><option value="">All projects</option></select>
+    </label>
+    <div class="field range-field" title="Date range for the overview and sessions (projects are all time)">
+      <span class="field-l" id="range-l">Range <span id="today-label" class="today-label"></span></span>
+      <div class="seg" id="range" role="group" aria-labelledby="range-l">
+        <button type="button" data-range="today">Today</button>
+        <button type="button" data-range="yesterday">Yesterday</button>
+        <button type="button" data-range="7d">7d</button>
+        <button type="button" data-range="30d">30d</button>
+        <button type="button" data-range="all">All</button>
+        <button type="button" data-range="custom">Custom</button>
+      </div>
+    </div>
+    <div class="field custom" id="custom" hidden>
+      <label><span class="field-l">From</span><input type="date" id="from"></label>
+      <label><span class="field-l">To</span><input type="date" id="to"></label>
+    </div>
+  </div>
+
+  <div class="live">
+    <span class="live-pill"><span class="dot" id="dot" data-live="false" aria-hidden="true"></span><span id="live-text" class="live-text">connecting</span></span>
+    <span id="updated" class="updated">not updated yet</span>
+    <button type="button" id="theme" class="icon-btn" aria-label="Switch to light theme" title="Switch theme"></button>
+  </div>
+</header>
+
+<div id="banner" class="banner" role="alert" hidden>
+  <span id="banner-msg"></span>
+  <button type="button" id="retry" class="btn">Retry</button>
+</div>
+
+<nav class="tabs" role="tablist" aria-label="Views">
+  <button type="button" role="tab" id="tab-overview" data-tab="overview" aria-controls="view-overview" aria-selected="true">Overview</button>
+  <button type="button" role="tab" id="tab-projects" data-tab="projects" aria-controls="view-projects" aria-selected="false" tabindex="-1">Projects <span class="tab-n" id="tabn-projects"></span></button>
+  <button type="button" role="tab" id="tab-sessions" data-tab="sessions" aria-controls="view-sessions" aria-selected="false" tabindex="-1">Sessions</button>
+</nav>
+
+<main>
+  <div id="view-overview" role="tabpanel" aria-labelledby="tab-overview">
+    <section id="kpis" class="kpis" aria-label="Key numbers"></section>
+
+    <section id="graphs" class="graphs" aria-label="Charts">
+      <div class="card" id="g-tier"><h2 class="card-h">Tier distribution</h2><div class="chart"></div></div>
+      <div class="card" id="g-cost"><h2 class="card-h">Cost per day</h2>
+        <div class="legend"><span><i class="sw sw-actual"></i>Router actual</span><span><i class="sw sw-base"></i>All-Opus baseline</span><span class="legend-lead" hidden><i class="sw sw-lead"></i>Lead session (not compared)</span></div>
+        <div class="chart"></div></div>
+      <div class="card" id="g-tasks"><h2 class="card-h">Tasks per day</h2><div class="chart"></div></div>
+    </section>
+
+    <section id="savings" class="savings" aria-label="Savings"></section>
+
+    <section id="tasks" class="tasks" aria-labelledby="feed-h">
+      <div class="sec-head">
+        <h2 id="feed-h" tabindex="-1">Tasks</h2>
+        <span id="list-count" class="sec-sub"></span>
+      </div>
+      <div class="toolbar" role="group" aria-label="Task filters">
+        <div class="tb-row">
+          <div class="chips" id="f-status" role="group" aria-label="Filter by status"></div>
+        </div>
+        <div class="tb-row">
+          <div class="chips" id="f-tier" role="group" aria-label="Filter by tier"></div>
+          <div class="search">
+            <svg class="search-ic" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true" focusable="false"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5 14 14"/></svg>
+            <input type="search" id="f-q" placeholder="Search label, result or project" autocomplete="off" aria-label="Search tasks" aria-keyshortcuts="/">
+            <kbd class="kbd" aria-hidden="true">/</kbd>
+            <button type="button" id="q-clear" class="q-clear" aria-label="Clear search" hidden>&#x2715;</button>
+          </div>
+          <label class="select-wrap"><span class="sel-l">Sort</span>
+            <select id="f-sort">
+              <option value="">Newest</option>
+              <option value="cost">Cost, high to low</option>
+              <option value="duration">Duration</option>
+              <option value="tokens">Tokens</option>
+            </select>
+          </label>
+          <label class="switch"><input type="checkbox" id="f-router"><span class="switch-ui" aria-hidden="true"></span>Router workers only</label>
+          <div class="seg seg-sm" id="density" role="group" aria-label="List density">
+            <button type="button" data-density="comfortable">Comfortable</button>
+            <button type="button" data-density="compact">Compact</button>
+          </div>
+        </div>
+        <div id="active-filters" class="active-filters" hidden></div>
+      </div>
+
+      <div class="workspace">
+        <div class="feed-col">
+          <div id="list-state" class="state" hidden></div>
+          <div id="list" class="feed"></div>
+          <div class="list-foot"><button type="button" class="btn" id="more" hidden>Load more</button></div>
+        </div>
+        <div class="detail-col" id="details">
+          <div class="detail" id="detail" aria-labelledby="details-h">
+            <div class="detail-head">
+              <h2 id="details-h" class="card-h" tabindex="-1">Task details</h2>
+              <button type="button" id="detail-close" class="icon-btn" aria-label="Close task details" title="Close (Esc)" hidden>&#x2715;</button>
+            </div>
+            <div id="detail-body" class="detail-body"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <details class="card pricing" id="pricing">
+      <summary><span class="card-h">Pricing</span><span class="sum-sub">US$ per million tokens</span></summary>
+      <div id="pricing-body"></div>
+    </details>
+  </div>
+
+  <div id="view-projects" role="tabpanel" aria-labelledby="tab-projects" hidden>
+    <div class="sec-head">
+      <h2 id="projects-h">Projects</h2>
+      <span class="sec-sub">All time. Open a project to filter the whole dashboard.</span>
+    </div>
+    <div class="toolbar">
+      <div class="tb-row">
+        <div class="search">
+          <svg class="search-ic" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true" focusable="false"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5 14 14"/></svg>
+          <input type="search" id="p-q" placeholder="Search projects" autocomplete="off" aria-label="Search projects">
+        </div>
+        <label class="select-wrap"><span class="sel-l">Sort</span>
+          <select id="p-sort">
+            <option value="recent">Recent</option>
+            <option value="spend">Spend</option>
+            <option value="tasks">Tasks</option>
+          </select>
+        </label>
+        <span id="p-count" class="sec-sub"></span>
+      </div>
+    </div>
+    <div id="projects-body" class="card-grid"></div>
+  </div>
+
+  <div id="view-sessions" role="tabpanel" aria-labelledby="tab-sessions" hidden>
+    <div class="sec-head">
+      <h2 id="sessions-h">Sessions</h2>
+      <span class="sec-sub">For the selected range and project, newest first. Open a session to filter the task list.</span>
+    </div>
+    <div class="toolbar">
+      <div class="tb-row">
+        <label class="select-wrap"><span class="sel-l">Sort</span>
+          <select id="s-sort">
+            <option value="recent">Recent</option>
+            <option value="spend">Spend</option>
+            <option value="tasks">Tasks</option>
+          </select>
+        </label>
+        <span id="s-count" class="sec-sub"></span>
+      </div>
+      <div id="sessions-chip-row" class="active-filters" hidden></div>
+    </div>
+    <div id="sessions-body"></div>
+  </div>
+</main>
+
+<footer class="foot" id="foot"></footer>
+<div id="tip" class="tip" role="presentation"></div>
+<div id="announce" class="sr" aria-live="polite"></div>
+<div id="backdrop" class="backdrop" hidden></div>
+
+<script src="app.js"></script>
+</body>
+</html>

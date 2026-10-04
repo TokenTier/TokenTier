@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    # Windows support is new and has not been verified on a real Windows machine yet: its job
+    # reports failures but does not block the build until it has been green for a while.
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.9", "3.11", "3.12"]
+        include:
+          - os: windows-latest
+            python: "3.9"
+          - os: windows-latest
+            python: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Unit tests
+        # `python` (not python3): setup-python provides it on every OS, and Windows has no python3.exe
+        run: python -m unittest discover -s tests -v
+
+      - name: Install shellcheck if missing
+        if: runner.os != 'Windows'
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            if [ "$RUNNER_OS" = "macOS" ]; then
+              brew install shellcheck
+            else
+              sudo apt-get update && sudo apt-get install -y shellcheck
+            fi
+          fi
+
+      - name: Shellcheck
+        if: runner.os != 'Windows'
+        run: shellcheck install.sh uninstall.sh
+
+      - name: PowerShell syntax check (Windows PowerShell 5.1)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $failed = $false
+          foreach ($f in @('install.ps1', 'uninstall.ps1', 'tests\windows_smoke.ps1')) {
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f).Path, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) { $failed = $true; $errors | ForEach-Object { Write-Host "$f : $_" } }
+            else { Write-Host "$f : OK" }
+          }
+          if ($failed) { exit 1 }
+
+      - name: PowerShell syntax check (PowerShell 7)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($f in @('install.ps1', 'uninstall.ps1', 'tests\windows_smoke.ps1')) {
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f).Path, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) { $failed = $true; $errors | ForEach-Object { Write-Host "$f : $_" } }
+            else { Write-Host "$f : OK" }
+          }
+          if ($failed) { exit 1 }
+
+      - name: Windows installer dry run (throwaway profile)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TOKENTIER_NO_SERVICE_EXEC: "1"
+        run: |
+          $h = Join-Path $env:RUNNER_TEMP 'tt home'
+          New-Item -ItemType Directory -Force -Path $h | Out-Null
+          $env:USERPROFILE = $h
+          $env:HOME = $h
+          .\install.ps1 --dry-run
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Windows smoke test (throwaway profile, no service)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests\windows_smoke.ps1
+
+      - name: Check dashboard JavaScript syntax
+        if: runner.os != 'Windows'
+        run: node --check dashboard/public/app.js
+
+      - name: Validate dashboard HTML
+        if: runner.os != 'Windows'
+        run: npx --yes html-validate@8 dashboard/public/index.html

@@ -1,0 +1,3157 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+"""TokenTier command line tool (Python 3.9+, stdlib only).
+
+    tokentier install   [--project [DIR]] [--claude-dir DIR] [--home DIR] [--port N]
+                        [--dry-run] [--yes] [--no-service] [--no-hooks]
+    tokentier uninstall [--project DIR] [--hooks-only] [--purge] [--keep-service]
+                        [--dry-run] [--yes] [--home DIR]
+    tokentier status    [--home DIR]
+    tokentier doctor    [--home DIR]
+    tokentier dashboard [--port N] [--home DIR]
+    tokentier config    list [--json] | get KEY | set KEY VALUE | unset KEY | path   [--home DIR]
+    tokentier prune     [--older-than DAYS] [--dry-run] [--yes] [--home DIR]
+    tokentier open      [--port N] [--home DIR]
+    tokentier stats     [--home DIR] [--days N] [--json] [--write-hints]
+    tokentier migrate legacy --file FILE [--redate SESSIONDATE:TASKID=YYYY-MM-DD ...]
+                        [--replace] [--project NAME] [--dry-run] [--home DIR]
+    tokentier version
+
+Environment:
+    TOKENTIER_HOME            TokenTier data dir (default ~/.tokentier)
+    TOKENTIER_PORT, TOKENTIER_RETENTION_DAYS, TOKENTIER_PRICING_PATH,
+    TOKENTIER_BASELINE_TOKEN_MULTIPLIER
+                              override the same keys of $TOKENTIER_HOME/config.json
+                              (precedence: CLI flag > env > config.json > default)
+    CLAUDE_CONFIG_DIR         Claude Code config dir (default ~/.claude)
+    TOKENTIER_NO_SERVICE_EXEC=1  never run launchctl/systemctl/schtasks and never touch the
+                              Windows registry (service files are still written); used by
+                              the test-suite
+    TOKENTIER_PLATFORM        override platform detection (darwin|linux|win32), for tests
+
+Windows: the home dir is %USERPROFILE%; hooks are registered in exec form (absolute python.exe
++ args, no shell); the always-on dashboard is a per-user Task Scheduler task (fallback: an
+HKCU Run entry). See README "Windows".
+"""
+import sys
+
+if sys.version_info < (3, 9):  # keep this check free of newer syntax
+    sys.stderr.write("TokenTier needs Python 3.9 or newer (found %d.%d). "
+                     "Install a newer python3 and re-run.\n" % sys.version_info[:2])
+    sys.exit(1)
+
+import argparse  # noqa: E402
+import copy  # noqa: E402
+import datetime as _dt  # noqa: E402
+import difflib  # noqa: E402
+import glob  # noqa: E402
+import hashlib  # noqa: E402
+import json  # noqa: E402
+import os  # noqa: E402
+import plistlib  # noqa: E402
+import re  # noqa: E402
+import shlex  # noqa: E402
+import shutil  # noqa: E402
+import socket  # noqa: E402
+import stat  # noqa: E402
+import subprocess  # noqa: E402
+import tempfile  # noqa: E402
+import time  # noqa: E402
+import urllib.request  # noqa: E402
+
+# --------------------------------------------------------------------- constants
+SELF = os.path.realpath(__file__)
+ROOT = os.path.dirname(os.path.dirname(SELF))
+
+MANIFEST_NAME = "install-manifest.json"
+MARK_START = "<!-- tokentier:start -->"
+MARK_END = "<!-- tokentier:end -->"
+DEFAULT_SNIPPET = "For non-trivial tasks, follow the model-router skill."
+HOOK_EVENTS = ("SessionStart", "SessionEnd", "SubagentStart", "SubagentStop", "Stop")
+NO_MATCHER_EVENTS = ("Stop",)  # Claude Code ignores matchers on these events; the entry carries none
+HOOK_MARK = "tokentier_log.py"
+HOOK_TIMEOUT = 10
+AGENT_FILES = ("fast-worker.md", "mid-worker.md", "deep-worker.md")
+LAUNCHD_LABEL = "dev.tokentier.dashboard"
+SYSTEMD_UNIT = "tokentier-dashboard.service"
+DEFAULT_PORT = 8899
+PRICING_REL = "dashboard/pricing.json"
+# Windows
+SCHTASKS_NAME = "TokenTier Dashboard"
+TASK_XML_NAME = "tokentier-dashboard-task.xml"
+RUNKEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUNKEY_NAME = "TokenTier Dashboard"
+SHIM_REL = "bin/tokentier.cmd"
+MIN_CLAUDE_EXEC_FORM = "2.1.139"  # first Claude Code release with exec-form hooks (`args`)
+WINREG = None  # tests inject a fake winreg module here
+REPLACE_RETRIES = 10
+REPLACE_DELAY = 0.05
+
+
+class Abort(Exception):
+    """Fatal, user-facing error. Nothing (more) is written."""
+
+
+# ----------------------------------------------------------------------- helpers
+def sha256_bytes(b):
+    return hashlib.sha256(b).hexdigest()
+
+
+def read_bytes(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+
+
+def sha256_file(path):
+    b = read_bytes(path)
+    return None if b is None else sha256_bytes(b)
+
+
+def now_iso():
+    return _dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _umask():
+    m = os.umask(0)
+    os.umask(m)
+    return m
+
+
+def _retryable_replace_error(e):
+    """PermissionError / WinError 5 (access denied), 32 or 33 (sharing/lock violation): on Windows
+    the target is briefly open in another process (antivirus, the dashboard reading a log)."""
+    return isinstance(e, PermissionError) or getattr(e, "winerror", None) in (5, 32, 33)
+
+
+def replace_retry(src, dst, retries=None, delay=None, sleep=None):
+    """os.replace with a short retry loop (default 10 x 50 ms) for transient Windows locks."""
+    sleep = sleep or time.sleep
+    retries = REPLACE_RETRIES if retries is None else retries
+    delay = REPLACE_DELAY if delay is None else delay
+    for attempt in range(retries):
+        try:
+            os.replace(src, dst)
+            return
+        except OSError as e:
+            if attempt == retries - 1 or not _retryable_replace_error(e):
+                raise
+            sleep(delay)
+
+
+def atomic_write(path, data, mode=None):
+    """Write bytes via a temp file in the same dir + fsync + os.replace (retried on transient
+    Windows sharing violations).
+
+    Symlinks are followed (the link target is replaced, the link is kept). The
+    existing file mode is preserved; new files get `mode` or 0666 & ~umask.
+    """
+    if os.path.islink(path):
+        path = os.path.realpath(path)
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    if mode is None:
+        try:
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+        except OSError:
+            mode = 0o666 & ~_umask()
+    fd, tmp = tempfile.mkstemp(prefix="." + os.path.basename(path) + ".", suffix=".tttmp", dir=d)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        if os.name == "nt":
+            pass  # NTFS has no mode bits; chmod could only make the temp file read-only
+        else:
+            os.chmod(tmp, mode)
+        replace_retry(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def unlink_retry(path, retries=None, delay=None):
+    """Delete a file; on Windows a file still open in another process (a dashboard that is just
+    stopping, antivirus) cannot be deleted, so retry briefly and then warn instead of aborting."""
+    retries = REPLACE_RETRIES if retries is None else retries
+    delay = REPLACE_DELAY if delay is None else delay
+    for attempt in range(retries):
+        try:
+            os.unlink(path)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError as e:
+            if not _retryable_replace_error(e):
+                raise
+            if attempt == retries - 1:
+                warn("could not delete %s (%s); it is in use. Delete it by hand later." % (path, e))
+                return False
+            time.sleep(delay)
+
+
+def home_dir():
+    # POSIX: $HOME. Windows: %USERPROFILE% (Python 3.8+ ignores HOME there).
+    return os.path.expanduser("~")
+
+
+def default_tokentier_home():
+    return os.path.join(home_dir(), ".tokentier")
+
+
+def resolve_home(arg):
+    h = arg or os.environ.get("TOKENTIER_HOME") or default_tokentier_home()
+    return os.path.abspath(os.path.expanduser(h))
+
+
+def default_claude_dir():
+    d = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(home_dir(), ".claude")
+    return os.path.abspath(os.path.expanduser(d))
+
+
+def platform_name():
+    p = os.environ.get("TOKENTIER_PLATFORM") or sys.platform
+    if p.startswith("darwin"):
+        return "darwin"
+    if p.startswith("linux"):
+        return "linux"
+    if p.lower() in ("win32", "windows", "nt"):
+        return "win32"
+    return p
+
+
+def is_windows(plat=None):
+    return (plat or platform_name()) == "win32"
+
+
+def fwd(path):
+    """Forward-slash form of a path (what we store in settings.json on Windows)."""
+    return path.replace("\\", "/")
+
+
+def shell_quote(s, plat=None):
+    """Quote one argument for the user's shell in printed hints (POSIX sh or Windows cmd/PowerShell)."""
+    if is_windows(plat):
+        return subprocess.list2cmdline([s])
+    return shlex.quote(s)
+
+
+def service_exec_enabled():
+    return os.environ.get("TOKENTIER_NO_SERVICE_EXEC", "") in ("", "0", "false", "no")
+
+
+def read_version(root=ROOT):
+    b = read_bytes(os.path.join(root, "VERSION"))
+    return b.decode("utf-8", "replace").strip() if b else "unknown"
+
+
+_CFG = []
+
+
+def cfgmod():
+    """The shared tokentier_dash.config module (lives next to the dashboard)."""
+    if not _CFG:
+        dash = os.path.join(ROOT, "dashboard")
+        if dash not in sys.path:
+            sys.path.insert(0, dash)
+        from tokentier_dash import config as c
+        _CFG.append(c)
+    return _CFG[0]
+
+
+def effective_port(home, flag=None, m=None):
+    """--port flag > TOKENTIER_PORT > config.json > port recorded for the service > 8899."""
+    vals, _ = cfgmod().resolve(home, {"port": flag})
+    port, src = vals["port"]
+    if src == "default":
+        port = ((m or {}).get("service") or {}).get("port") or DEFAULT_PORT
+    return port
+
+
+def same_path(a, b):
+    # normcase: Windows paths compare case-insensitively (and / == \); identity on POSIX
+    return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+
+
+def backup_rel(path, pathmod=os.path):
+    """Relative path under a backup dir that mirrors the absolute `path`.
+
+    POSIX: /Users/a/x -> Users/a/x. Windows: C:\\Users\\a\\x -> C\\Users\\a\\x and
+    \\\\server\\share\\x -> UNC\\server\\share\\x. (A plain lstrip(sep) would keep "C:\\..."
+    absolute on Windows, and os.path.join would then discard the backup dir.)"""
+    p = pathmod.abspath(path)
+    drive, rest = pathmod.splitdrive(p)
+    parts = []
+    if drive:
+        d = drive.replace("/", "\\") if pathmod.sep == "\\" else drive
+        if d.startswith("\\\\"):
+            parts.append("UNC")
+            parts.extend(x for x in d.strip("\\").split("\\") if x)
+        else:
+            parts.append(d.rstrip(":") or "drive")
+    seps = pathmod.sep + (pathmod.altsep or "")
+    parts.append(rest.lstrip(seps))
+    return pathmod.join(*[x for x in parts if x]) if any(parts) else "root"
+
+
+def say(msg=""):
+    print(msg, flush=True)
+
+
+def warn(msg):
+    print("WARNING: " + msg, flush=True)
+
+
+# ------------------------------------------------------------------ source tree
+class Source(object):
+    """The tree we install from: a repo checkout (kit/...) or an installed app dir."""
+
+    def __init__(self, root=ROOT):
+        self.root = root
+        self.kit = os.path.join(root, "kit")
+        hooks = [os.path.join(root, "kit", "hooks", "tokentier_log.py"),
+                 os.path.join(root, "hooks", "tokentier_log.py")]
+        self.hook = next((h for h in hooks if os.path.isfile(h)), hooks[0])
+        self.dashboard = os.path.join(root, "dashboard")
+        self.version = read_version(root)
+
+    def check(self):
+        need = [self.hook, os.path.join(self.dashboard, "server.py"),
+                os.path.join(self.kit, "skills", "model-router", "SKILL.md")]
+        need += [os.path.join(self.kit, "agents", a) for a in AGENT_FILES]
+        missing = [p for p in need if not os.path.isfile(p)]
+        if missing:
+            raise Abort("source tree %s is incomplete, missing: %s" % (self.root, ", ".join(missing)))
+
+    def snippet(self):
+        b = read_bytes(os.path.join(self.kit, "claude-md-snippet.md"))
+        line = b.decode("utf-8").strip() if b else ""
+        return line.splitlines()[0].strip() if line else DEFAULT_SNIPPET
+
+    def agent(self, name):
+        return read_bytes(os.path.join(self.kit, "agents", name))
+
+    def skill(self):
+        return read_bytes(os.path.join(self.kit, "skills", "model-router", "SKILL.md"))
+
+    def app_files(self):
+        """[(relpath inside app dir, absolute source path)] in a stable order."""
+        out = [("VERSION", os.path.join(self.root, "VERSION")),
+               ("bin/tokentier", os.path.join(self.root, "bin", "tokentier")),
+               ("hooks/tokentier_log.py", self.hook)]
+        for base, prefix in ((self.dashboard, "dashboard"), (self.kit, "kit")):
+            for dp, dns, fns in os.walk(base):
+                # kit/hooks is installed as app/hooks (above), not twice
+                dns[:] = sorted(d for d in dns if d != "__pycache__"
+                                and not (base == self.kit and dp == base and d == "hooks"))
+                for fn in sorted(fns):
+                    if fn.endswith((".pyc", ".pyo")) or fn == ".DS_Store" or fn.endswith(".new"):
+                        continue
+                    src = os.path.join(dp, fn)
+                    rel = prefix + "/" + os.path.relpath(src, base).replace(os.sep, "/")
+                    out.append((rel, src))
+        return [(r, s) for r, s in out if os.path.isfile(s)]
+
+
+# ------------------------------------------------------------------ manifest
+def manifest_path(home):
+    return os.path.join(home, MANIFEST_NAME)
+
+
+def load_manifest(home):
+    p = manifest_path(home)
+    b = read_bytes(p)
+    if b is None:
+        return None
+    try:
+        m = json.loads(b.decode("utf-8"))
+    except ValueError as e:
+        raise Abort("manifest %s is not valid JSON (%s). Fix or move it aside." % (p, e))
+    if not isinstance(m, dict):
+        raise Abort("manifest %s is not a JSON object" % p)
+    m.setdefault("projects", [])
+    m.setdefault("backups", [])
+    m.setdefault("app", {"dir": os.path.join(home, "app"), "files": {}})
+    m["app"].setdefault("files", {})
+    return m
+
+
+def new_manifest(home):
+    return {"manifest_version": 1, "name": "tokentier", "version": None, "installed_at": None,
+            "updated_at": None, "tokentier_home": home,
+            "app": {"dir": os.path.join(home, "app"), "files": {}},
+            "global": None, "projects": [], "service": None, "backups": []}
+
+
+def save_manifest(home, m):
+    atomic_write(manifest_path(home),
+                 (json.dumps(m, indent=2, ensure_ascii=False, sort_keys=False) + "\n").encode("utf-8"))
+
+
+def find_project(m, project_dir):
+    for p in m.get("projects", []):
+        if p.get("project_dir") and same_path(p["project_dir"], project_dir):
+            return p
+    return None
+
+
+# --------------------------------------------------------------- JSON settings
+class SettingsError(Abort):
+    pass
+
+
+def _no_dupes(pairs):
+    d = {}
+    for k, v in pairs:
+        if k in d:
+            raise ValueError("duplicate key %r" % k)
+        d[k] = v
+    return d
+
+
+def parse_settings(raw, path):
+    """bytes|None -> dict. Missing or whitespace-only -> {}. Raises SettingsError."""
+    if raw is None:
+        return {}
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError as e:
+        raise SettingsError("%s is not UTF-8 (%s). TokenTier changed nothing." % (path, e))
+    if not text.strip():
+        return {}
+    try:
+        data = json.loads(text, object_pairs_hook=_no_dupes)
+    except ValueError as e:
+        raise SettingsError("%s is not valid JSON (%s). TokenTier changed nothing. Fix the file "
+                            "(or move it aside) and run the command again." % (path, e))
+    if not isinstance(data, dict):
+        raise SettingsError("%s: top-level JSON value is a %s, expected an object. TokenTier "
+                            "changed nothing." % (path, type(data).__name__))
+    return data
+
+
+def json_style(raw):
+    """Detect indent / newline / trailing newline / BOM of an existing JSON file."""
+    style = {"indent": 2, "nl": "\n", "trailing": True, "bom": False}
+    if not raw:
+        return style
+    text = raw.decode("utf-8", "replace")
+    if text.startswith("\ufeff"):
+        style["bom"] = True
+        text = text[1:]
+    if "\r\n" in text:
+        style["nl"] = "\r\n"
+    m = re.search(r"\n([ \t]+)\S", text)
+    if m:
+        ind = m.group(1)
+        style["indent"] = ind if "\t" in ind else len(ind)
+    style["trailing"] = text.endswith("\n")
+    return style
+
+
+def dump_settings(data, style):
+    text = json.dumps(data, indent=style["indent"], ensure_ascii=False)
+    if style["nl"] != "\n":
+        text = text.replace("\n", style["nl"])
+    if style["trailing"]:
+        text += style["nl"]
+    if style["bom"]:
+        text = "\ufeff" + text
+    return text.encode("utf-8")
+
+
+def is_our_handler(h):
+    """True for a hook handler that runs tokentier_log.py: POSIX shell form (the script is in
+    `command`) or Windows exec form (the script is one of the `args`)."""
+    if not isinstance(h, dict):
+        return False
+    if HOOK_MARK in str(h.get("command", "")):
+        return True
+    args = h.get("args")
+    return isinstance(args, list) and any(HOOK_MARK in str(a) for a in args)
+
+
+def our_hook_refs(groups):
+    """[(group_index, hook_index)] of hooks whose command or args mention tokentier_log.py."""
+    out = []
+    if not isinstance(groups, list):
+        return out
+    for gi, g in enumerate(groups):
+        if not isinstance(g, dict) or not isinstance(g.get("hooks"), list):
+            continue
+        for hi, h in enumerate(g["hooks"]):
+            if is_our_handler(h):
+                out.append((gi, hi))
+    return out
+
+
+def our_handlers(path):
+    """All TokenTier hook handlers (dicts) registered in one settings file ([] if unreadable)."""
+    raw = read_bytes(path)
+    try:
+        data = parse_settings(raw, path)
+    except SettingsError:
+        return []
+    hooks = data.get("hooks")
+    out = []
+    if isinstance(hooks, dict):
+        for e in HOOK_EVENTS:
+            lst = hooks.get(e)
+            for gi, hi in our_hook_refs(lst):
+                out.append(lst[gi]["hooks"][hi])
+    return out
+
+
+def count_our_hooks(path):
+    """({event: n}, error_or_None) for one settings file (missing file -> zeros)."""
+    counts = {e: 0 for e in HOOK_EVENTS}
+    raw = read_bytes(path)
+    if raw is None:
+        return counts, None
+    try:
+        data = parse_settings(raw, path)
+    except SettingsError as e:
+        return counts, str(e)
+    hooks = data.get("hooks")
+    if isinstance(hooks, dict):
+        for e in HOOK_EVENTS:
+            counts[e] = len(our_hook_refs(hooks.get(e)))
+    return counts, None
+
+
+def hook_command(event, home):
+    """POSIX (macOS/Linux) shell-form command string. Must stay byte-for-byte stable: existing
+    installs are matched and upgraded by it."""
+    script = os.path.join(home, "app", "hooks", "tokentier_log.py")
+    cmd = "python3 %s %s" % (shlex.quote(script), event)
+    if not same_path(home, default_tokentier_home()):
+        cmd = "TOKENTIER_HOME=%s %s" % (shlex.quote(home), cmd)
+    return cmd
+
+
+def hook_python():
+    """Absolute interpreter written into Windows hook entries and services: the Python that runs
+    the installer (never a bare `python3`, which on Windows may be the Microsoft Store stub). In a
+    venv the base interpreter is preferred so the hooks survive deleting the venv."""
+    exe = sys.executable or ""
+    if getattr(sys, "base_prefix", sys.prefix) != sys.prefix:
+        base = getattr(sys, "_base_executable", None)
+        if base and os.path.isfile(base):
+            exe = base
+    return os.path.abspath(exe) if exe else "python"
+
+
+def windowless_python(py):
+    """pythonw.exe next to python.exe (no console window), else `py` itself."""
+    d, b = os.path.split(py)
+    m = re.match(r"(?i)^python([0-9.]*)\.exe$", b)
+    if m:
+        w = os.path.join(d, "pythonw%s.exe" % m.group(1))
+        if os.path.isfile(w):
+            return w
+    return py
+
+
+def hook_args(event, home):
+    """Windows exec-form argv (after the interpreter): script, event[, --home HOME]."""
+    args = [fwd(os.path.join(home, "app", "hooks", "tokentier_log.py")), event]
+    if not same_path(home, default_tokentier_home()):
+        args += ["--home", fwd(home)]
+    return args
+
+
+def hook_handler(event, home, plat=None):
+    """The hook handler dict for `event`.
+
+    macOS/Linux: shell form {"type","command","timeout"} (unchanged since v0.1).
+    Windows: exec form {"type","command","args","timeout"}: Claude Code spawns the absolute
+    python.exe directly with `args` (no Git Bash / PowerShell, so spaces in user names and
+    quoting never matter). Needs Claude Code >= 2.1.139."""
+    if is_windows(plat):
+        return {"type": "command", "command": fwd(hook_python()), "args": hook_args(event, home),
+                "timeout": HOOK_TIMEOUT}
+    return {"type": "command", "command": hook_command(event, home), "timeout": HOOK_TIMEOUT}
+
+
+def hook_group(event, home, plat=None):
+    g = {"hooks": [hook_handler(event, home, plat)]}
+    if event not in NO_MATCHER_EVENTS:
+        g = dict([("matcher", "")] + list(g.items()))
+    return g
+
+
+def update_handler(h, want):
+    """Bring our existing handler `h` to the wanted form in place (keeps user-added keys)."""
+    if h.get("command") != want["command"]:
+        h["command"] = want["command"]
+    if "args" in want:
+        if h.get("args") != want["args"]:
+            h["args"] = list(want["args"])
+    elif "args" in h:
+        del h["args"]  # POSIX shell form carries everything in `command`
+
+
+# ------------------------------------------------------------------ CLAUDE.md
+def _dec(b):
+    return b.decode("utf-8", "surrogateescape")
+
+
+def _enc(s):
+    return s.encode("utf-8", "surrogateescape")
+
+
+def find_block(text):
+    """(start_idx, end_idx) of our marker block incl. the end-marker line break, or None."""
+    s = text.find(MARK_START)
+    if s < 0:
+        return None
+    e = text.find(MARK_END, s)
+    if e < 0:
+        return None
+    e += len(MARK_END)
+    if text.startswith("\r\n", e):
+        e += 2
+    elif text.startswith("\n", e):
+        e += 1
+    # start of the marker line
+    ls = text.rfind("\n", 0, s) + 1
+    return ls, e
+
+
+def line_outside_block(text, line):
+    blk = find_block(text)
+    outside = text if not blk else text[:blk[0]] + text[blk[1]:]
+    return any(l.rstrip("\r").strip() == line for l in outside.split("\n"))
+
+
+def claude_md_insert(text, line):
+    """Return (new_text, inserted_string) appending our marker block."""
+    nl = "\r\n" if "\r\n" in text else "\n"
+    block = MARK_START + nl + line + nl + MARK_END + nl
+    if text == "":
+        sep = ""
+    elif text.endswith(nl + nl) or text.endswith("\n\n"):
+        sep = ""
+    elif text.endswith("\n"):
+        sep = nl
+    else:
+        sep = nl + nl
+    return text + sep + block, sep + block
+
+
+def claude_md_remove(text, rec, line):
+    """Undo our insertion. Returns (new_text, note_or_None)."""
+    ins = rec.get("inserted")
+    if ins and text.endswith(ins):
+        return text[:-len(ins)], None
+    if ins and ins in text:
+        i = text.rfind(ins)
+        return text[:i] + text[i + len(ins):], None
+    blk = find_block(text)
+    if not blk:
+        return text, "marker block not found (left unchanged)"
+    inner = text[blk[0]:blk[1]]
+    keep = [l for l in inner.splitlines(True)
+            if l.strip() not in (MARK_START, MARK_END, line)]
+    return text[:blk[0]] + "".join(keep) + text[blk[1]:], "block was edited; removed only our lines"
+
+
+# --------------------------------------------------------------------- planning
+class Action(object):
+    """One filesystem change or command. kinds: write, delete, mkdir, rmdir, rmtree, backup, cmd."""
+
+    def __init__(self, kind, path=None, data=None, desc="", mode=None, src=None, cmd=None,
+                 diff_old=None, show_diff=False, counts=True, ensure=None):
+        self.kind, self.path, self.data, self.desc = kind, path, data, desc
+        self.mode, self.src, self.cmd = mode, src, cmd
+        self.diff_old, self.show_diff, self.counts, self.ensure = diff_old, show_diff, counts, ensure
+
+
+class Plan(object):
+    def __init__(self, ctx):
+        self.ctx = ctx
+        self.actions = []
+        self.notes = []
+        self.warnings = []
+        self._backup_dir = None
+        self._backup_names = set()
+
+    def add(self, a):
+        self.actions.append(a)
+        return a
+
+    def backup_dir(self):
+        if self._backup_dir is None:
+            base = os.path.join(self.ctx.home, "backups")
+            stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+            d = os.path.join(base, stamp)
+            n = 1
+            while os.path.exists(d):
+                d = os.path.join(base, "%s-%d" % (stamp, n))
+                n += 1
+            self._backup_dir = d
+        return self._backup_dir
+
+    def backup(self, path, data):
+        """Plan a backup of `data` (current bytes of `path`); returns the backup path."""
+        dest = os.path.join(self.backup_dir(), backup_rel(path))
+        self.add(Action("backup", dest, data=data, desc="back up %s" % path, mode=0o600))
+        return dest
+
+    def changes(self):
+        return [a for a in self.actions if a.counts]
+
+
+class Ctx(object):
+    def __init__(self, home, dry_run=False):
+        self.home = home
+        self.dry_run = dry_run
+        self.app_dir = os.path.join(home, "app")
+        self.logs = os.path.join(home, "logs")
+        self.platform = platform_name()
+        self.service_exec = service_exec_enabled()
+
+
+def plan_mkdir(plan, path, created_list=None):
+    """Plan creation of `path` and every missing parent; record them all in created_list."""
+    missing = []
+    p = os.path.abspath(path)
+    while not os.path.isdir(p):
+        missing.append(p)
+        parent = os.path.dirname(p)
+        if parent == p:
+            break
+        p = parent
+    for d in reversed(missing):
+        if not any(a.kind == "mkdir" and a.path == d for a in plan.actions):
+            plan.add(Action("mkdir", d, desc="create dir %s" % d))
+        if created_list is not None and d not in created_list:
+            created_list.append(d)
+
+
+def plan_kit_file(plan, dest, new, files_rec, label):
+    cur = read_bytes(dest)
+    r = files_rec.get(dest)
+    nh = sha256_bytes(new)
+    if r is None:
+        if cur is None:
+            plan.add(Action("write", dest, new, "create %s (%s)" % (dest, label)))
+            files_rec[dest] = {"sha256": nh, "created": True, "backup": None, "kind": label}
+        elif cur == new:
+            files_rec[dest] = {"sha256": nh, "created": False, "preexisting": True, "backup": None,
+                               "kind": label}
+            plan.notes.append("%s already identical, left as is" % dest)
+        else:
+            bk = plan.backup(dest, cur)
+            plan.add(Action("write", dest, new, "replace %s (%s); old version backed up" % (dest, label)))
+            files_rec[dest] = {"sha256": nh, "created": False, "backup": bk, "kind": label}
+        return
+    if cur == new:
+        r["sha256"] = nh
+        return
+    if cur is None:
+        plan.add(Action("write", dest, new, "re-create %s (%s)" % (dest, label)))
+    else:
+        if sha256_bytes(cur) != r.get("sha256"):
+            bk = plan.backup(dest, cur)
+            r.setdefault("extra_backups", []).append(bk)
+            plan.warnings.append("%s was edited after install; your version is backed up to %s"
+                                 % (dest, bk))
+        elif not r.get("created") and not r.get("backup"):
+            # pre-existing identical file that we now upgrade: keep the original for uninstall
+            r["backup"] = plan.backup(dest, cur)
+        plan.add(Action("write", dest, new, "update %s (%s)" % (dest, label)))
+    r["sha256"] = nh
+
+
+def plan_claude_md(plan, path, line, rec):
+    cur = read_bytes(path)
+    text = _dec(cur) if cur is not None else ""
+    if find_block(text):
+        if rec.get("state") != "added":
+            rec.update({"state": "added", "path": path, "inserted": rec.get("inserted"),
+                        "created_file": rec.get("created_file", False)})
+        return
+    if line_outside_block(text, line):
+        if rec.get("state") != "preexisting":
+            rec.clear()
+            rec.update({"state": "preexisting", "path": path})
+            plan.notes.append("%s already contains the router line; not adding it again" % path)
+        return
+    new, ins = claude_md_insert(text, line)
+    plan.add(Action("write", path, _enc(new), "%s %s (add router line between tokentier markers)"
+                    % ("create" if cur is None else "update", path),
+                    diff_old=cur if cur is not None else b"", show_diff=True))
+    rec.clear()
+    rec.update({"state": "added", "path": path, "created_file": cur is None, "inserted": ins,
+                "sha256_after": sha256_bytes(_enc(new))})
+
+
+def plan_settings(plan, path, home, rec, add_hooks, skip_reason):
+    raw = read_bytes(path)
+    data = parse_settings(raw, path)  # aborts on invalid JSON before anything is written
+    rec.setdefault("path", path)
+    rec.setdefault("entries", [])
+    if not add_hooks:
+        if not rec.get("entries"):
+            rec["hooks_skipped"] = skip_reason
+        return
+    rec.pop("hooks_skipped", None)
+    new = copy.deepcopy(data)
+    hooks = new.get("hooks")
+    created_key = False
+    if hooks is None:
+        hooks = new["hooks"] = {}
+        created_key = True
+    if not isinstance(hooks, dict):
+        raise SettingsError("%s: \"hooks\" is a %s, expected an object. TokenTier changed nothing."
+                            % (path, type(hooks).__name__))
+    created_events = []
+    entries = []
+    for ev in HOOK_EVENTS:
+        lst = hooks.get(ev)
+        if lst is None:
+            lst = hooks[ev] = []
+            created_events.append(ev)
+        if not isinstance(lst, list):
+            raise SettingsError("%s: hooks.%s is a %s, expected a list. TokenTier changed nothing."
+                                % (path, ev, type(lst).__name__))
+        refs = our_hook_refs(lst)
+        want = hook_handler(ev, home)
+        if refs:
+            for gi, hi in refs:
+                update_handler(lst[gi]["hooks"][hi], want)
+            if len(refs) > 1:
+                plan.warnings.append("%s has %d TokenTier hooks for %s (duplicate logging); run "
+                                     "`tokentier doctor`" % (path, len(refs), ev))
+            entries.append({"event": ev, "group": copy.deepcopy(lst[refs[0][0]])})
+        else:
+            g = hook_group(ev, home)
+            lst.append(g)
+            entries.append({"event": ev, "group": copy.deepcopy(g)})
+    out = None
+    if new != data or raw is None:
+        style = json_style(raw)
+        out = dump_settings(new, style)
+    if out is not None and out != raw:
+        if raw is not None and not rec.get("backup_original") and not rec.get("created_file"):
+            rec["backup_original"] = plan.backup(path, raw)
+        elif raw is not None:
+            plan.backup(path, raw)
+        plan.add(Action("write", path, out, "%s %s (add %d TokenTier hook entries)"
+                        % ("create" if raw is None else "update", path, len(HOOK_EVENTS)),
+                        diff_old=raw if raw is not None else b"", show_diff=True))
+        if raw is None:
+            rec["created_file"] = True
+        if created_key:
+            rec["created_hooks_key"] = True
+        rec["created_events"] = sorted(set(rec.get("created_events", [])) | set(created_events))
+    rec["entries"] = entries
+    rec.setdefault("created_file", False)
+
+
+# ---------------------------------------------------------------- service
+def service_python(plat=None):
+    if is_windows(plat):
+        return windowless_python(hook_python())  # pythonw.exe: no console window for the service
+    return shutil.which("python3") or sys.executable
+
+
+def task_xml_path(home):
+    return os.path.join(home, TASK_XML_NAME)
+
+
+def windows_user():
+    """DOMAIN\\user of the current user (for the Task Scheduler principal), or None."""
+    user = os.environ.get("USERNAME") or os.environ.get("USER")
+    if not user:
+        return None
+    dom = os.environ.get("USERDOMAIN")
+    return "%s\\%s" % (dom, user) if dom else user
+
+
+def server_argv(home, port, python):
+    return [python, os.path.join(home, "app", "dashboard", "server.py"), "--home", home,
+            "--host", "127.0.0.1", "--port", str(port)]
+
+
+def task_xml(home, port, python, user=None):
+    """Task Scheduler 1.2 XML (UTF-16 LE with BOM, as schtasks /XML expects) for a per-user task:
+    starts pythonw.exe server.py at logon of this user, restarts every minute on failure (999x),
+    no battery limits, no time limit, one instance. Task Scheduler has no per-task environment,
+    so the TokenTier home is passed as `--home`."""
+    from xml.sax.saxutils import escape as x
+    argv = server_argv(home, port, python)
+    args = subprocess.list2cmdline(argv[1:])
+    user = user if user is not None else windows_user()
+    uid = "<UserId>%s</UserId>" % x(user) if user else ""
+    text = (
+        '<?xml version="1.0" encoding="UTF-16"?>\r\n'
+        '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\r\n'
+        '  <RegistrationInfo>\r\n'
+        '    <Author>TokenTier</Author>\r\n'
+        '    <Description>TokenTier dashboard (local only, http://127.0.0.1:%(port)d/)</Description>\r\n'
+        '  </RegistrationInfo>\r\n'
+        '  <Triggers>\r\n'
+        '    <LogonTrigger>\r\n'
+        '      <Enabled>true</Enabled>\r\n'
+        '      %(uid)s\r\n'
+        '    </LogonTrigger>\r\n'
+        '  </Triggers>\r\n'
+        '  <Principals>\r\n'
+        '    <Principal id="Author">\r\n'
+        '      %(uid)s\r\n'
+        '      <LogonType>InteractiveToken</LogonType>\r\n'
+        '      <RunLevel>LeastPrivilege</RunLevel>\r\n'
+        '    </Principal>\r\n'
+        '  </Principals>\r\n'
+        '  <Settings>\r\n'
+        '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r\n'
+        '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n'
+        '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\r\n'
+        '    <AllowHardTerminate>true</AllowHardTerminate>\r\n'
+        '    <StartWhenAvailable>true</StartWhenAvailable>\r\n'
+        '    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\r\n'
+        '    <IdleSettings>\r\n'
+        '      <StopOnIdleEnd>false</StopOnIdleEnd>\r\n'
+        '      <RestartOnIdle>false</RestartOnIdle>\r\n'
+        '    </IdleSettings>\r\n'
+        '    <AllowStartOnDemand>true</AllowStartOnDemand>\r\n'
+        '    <Enabled>true</Enabled>\r\n'
+        '    <Hidden>false</Hidden>\r\n'
+        '    <RunOnlyIfIdle>false</RunOnlyIfIdle>\r\n'
+        '    <WakeToRun>false</WakeToRun>\r\n'
+        '    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\r\n'
+        '    <Priority>7</Priority>\r\n'
+        '    <RestartOnFailure>\r\n'
+        '      <Interval>PT1M</Interval>\r\n'
+        '      <Count>999</Count>\r\n'
+        '    </RestartOnFailure>\r\n'
+        '  </Settings>\r\n'
+        '  <Actions Context="Author">\r\n'
+        '    <Exec>\r\n'
+        '      <Command>%(cmd)s</Command>\r\n'
+        '      <Arguments>%(args)s</Arguments>\r\n'
+        '      <WorkingDirectory>%(wd)s</WorkingDirectory>\r\n'
+        '    </Exec>\r\n'
+        '  </Actions>\r\n'
+        '</Task>\r\n') % {"port": port, "uid": uid, "cmd": x(python), "args": x(args),
+                          "wd": x(home)}  # not app\dashboard: Windows cannot delete a process's cwd
+    return b"\xff\xfe" + text.encode("utf-16-le")
+
+
+def runkey_command(home, port, python):
+    """Command line stored in HKCU\\...\\Run when Task Scheduler is not available."""
+    return subprocess.list2cmdline(server_argv(home, port, python))
+
+
+def _winreg():
+    if WINREG is not None:
+        return WINREG
+    import winreg  # Windows only
+    return winreg
+
+
+def runkey_get():
+    w = _winreg()
+    try:
+        k = w.OpenKey(w.HKEY_CURRENT_USER, RUNKEY_PATH, 0, w.KEY_READ)
+    except OSError:
+        return None
+    try:
+        return w.QueryValueEx(k, RUNKEY_NAME)[0]
+    except OSError:
+        return None
+    finally:
+        w.CloseKey(k)
+
+
+def runkey_set(value):
+    w = _winreg()
+    k = w.CreateKeyEx(w.HKEY_CURRENT_USER, RUNKEY_PATH, 0, w.KEY_SET_VALUE)
+    try:
+        w.SetValueEx(k, RUNKEY_NAME, 0, w.REG_SZ, value)
+    finally:
+        w.CloseKey(k)
+
+
+def runkey_delete():
+    """True if our value existed and was removed."""
+    w = _winreg()
+    try:
+        k = w.OpenKey(w.HKEY_CURRENT_USER, RUNKEY_PATH, 0, w.KEY_SET_VALUE)
+    except OSError:
+        return False
+    try:
+        w.DeleteValue(k, RUNKEY_NAME)
+        return True
+    except OSError:
+        return False
+    finally:
+        w.CloseKey(k)
+
+
+def start_detached(argv, cwd=None):
+    """Start a background process that outlives the installer, without a console window."""
+    kw = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
+          "close_fds": True, "cwd": cwd}
+    if os.name == "nt":
+        kw["creationflags"] = (getattr(subprocess, "DETACHED_PROCESS", 0x8)
+                               | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200))
+    else:
+        kw["start_new_session"] = True
+    return subprocess.Popen(argv, **kw)
+
+
+def launchd_plist_path():
+    return os.path.join(home_dir(), "Library", "LaunchAgents", LAUNCHD_LABEL + ".plist")
+
+
+def systemd_unit_path():
+    return os.path.join(home_dir(), ".config", "systemd", "user", SYSTEMD_UNIT)
+
+
+def launchd_plist(home, port, python):
+    log = os.path.join(home, "dashboard.log")
+    d = {
+        "Label": LAUNCHD_LABEL,
+        "ProgramArguments": [python, os.path.join(home, "app", "dashboard", "server.py"),
+                             "--host", "127.0.0.1", "--port", str(port)],
+        "EnvironmentVariables": {"TOKENTIER_HOME": home},
+        "WorkingDirectory": os.path.join(home, "app", "dashboard"),
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "ThrottleInterval": 30,
+        "ProcessType": "Background",
+        "StandardOutPath": log,
+        "StandardErrorPath": log,
+    }
+    return plistlib.dumps(d, fmt=plistlib.FMT_XML, sort_keys=False)
+
+
+def _sd_quote(s):
+    if re.search(r"[\s\"'\\]", s):
+        return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return s
+
+
+def systemd_unit(home, port, python):
+    server = os.path.join(home, "app", "dashboard", "server.py")
+    log = os.path.join(home, "dashboard.log")
+    return ("[Unit]\n"
+            "Description=TokenTier dashboard (local only, http://127.0.0.1:%(port)d/)\n"
+            "\n"
+            "[Service]\n"
+            "Type=simple\n"
+            "ExecStart=%(py)s %(server)s --host 127.0.0.1 --port %(port)d\n"
+            "Environment=%(env)s\n"
+            "WorkingDirectory=%(wd)s\n"
+            "Restart=on-failure\n"
+            "RestartSec=5\n"
+            "StandardOutput=append:%(log)s\n"
+            "StandardError=append:%(log)s\n"
+            "\n"
+            "[Install]\n"
+            "WantedBy=default.target\n") % {
+        "port": port, "py": _sd_quote(python), "server": _sd_quote(server),
+        "env": _sd_quote("TOKENTIER_HOME=" + home), "wd": _sd_quote(os.path.dirname(server)),
+        "log": log}
+
+
+def _under(path, root):
+    try:
+        return os.path.commonpath([os.path.abspath(path), os.path.abspath(root)]) == os.path.abspath(root)
+    except ValueError:
+        return False
+
+
+def _uid():
+    """launchd's gui/<uid> domain; os.getuid does not exist on Windows (only reached when the
+    platform is overridden for tests)."""
+    return os.getuid() if hasattr(os, "getuid") else 0
+
+
+def run_cmd(ctx, cmd, check=False, quiet=False):
+    """Run a service-manager command unless TOKENTIER_NO_SERVICE_EXEC is set."""
+    if not ctx.service_exec:
+        if not quiet:
+            say("  (skipped, TOKENTIER_NO_SERVICE_EXEC is set) %s" % " ".join(cmd))
+        return None
+    try:
+        # argv list, never shell=True. errors="replace": schtasks prints in the OEM code page.
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           universal_newlines=True, errors="replace", timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        if check:
+            raise Abort("%s failed: %s" % (" ".join(cmd), e))
+        return None
+    if check and p.returncode != 0:
+        raise Abort("%s failed (exit %d): %s" % (" ".join(cmd), p.returncode,
+                                                 (p.stderr or p.stdout).strip()))
+    return p
+
+
+def service_manager(ctx):
+    """('launchd'|'systemd', None) or (None, reason)."""
+    if ctx.platform == "darwin":
+        if ctx.service_exec and not shutil.which("launchctl"):
+            return None, "launchctl not found"
+        return "launchd", None
+    if ctx.platform == "linux":
+        if not ctx.service_exec:
+            return "systemd", None
+        if not shutil.which("systemctl"):
+            return None, "systemctl not found (no systemd)"
+        p = run_cmd(ctx, ["systemctl", "--user", "show-environment"], quiet=True)
+        if p is None or p.returncode != 0:
+            return None, "the systemd user manager is not reachable (systemctl --user failed)"
+        return "systemd", None
+    if ctx.platform == "win32":
+        # per-user Task Scheduler task; if schtasks is missing or refuses, ensure_service falls
+        # back to an HKCU Run entry
+        return "schtasks", None
+    return None, "always-on service is not supported on %s" % ctx.platform
+
+
+def _bind_probe_busy(host, port, plat=None):
+    """True if binding host:port fails, i.e. something else holds it."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if is_windows(plat):
+            # On Windows SO_REUSEADDR lets a second socket bind a port that is IN USE, so it must
+            # not be set; SO_EXCLUSIVEADDRUSE makes the probe fail whenever anyone holds the port.
+            excl = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+            if excl is not None:
+                s.setsockopt(socket.SOL_SOCKET, excl, 1)
+        else:
+            # SO_REUSEADDR allows binding to a port in TIME_WAIT state on macOS after a server is killed
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((host, port))
+    except OSError:
+        return True
+    finally:
+        s.close()
+    return False
+
+
+def port_state(port, host="127.0.0.1", retries=2):
+    """'free' | 'tokentier' | 'other'. A busy port whose HTTP health probe fails is re-probed
+    briefly so a TokenTier dashboard that is still starting is not reported as foreign."""
+    busy = False
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            busy = True
+    except OSError:
+        pass
+    if not busy:
+        busy = _bind_probe_busy(host, port)
+    if not busy:
+        return "free"
+    for attempt in range(retries + 1):
+        if http_health(port):
+            return "tokentier"
+        if attempt < retries:
+            time.sleep(0.4)
+    return "other"
+
+
+def http_health(port, host="127.0.0.1"):
+    """Health JSON if a TokenTier server answers on port, else None."""
+    try:
+        # no proxies: Windows (registry) and HTTP_PROXY settings would otherwise route 127.0.0.1 via a proxy
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open("http://%s:%d/api/health" % (host, port), timeout=1.5) as r:
+            server = r.headers.get("Server", "")
+            body = json.loads(r.read().decode("utf-8"))
+            if "TokenTier" in server and isinstance(body, dict) and body.get("ok"):
+                return body
+    except Exception:
+        return None
+    return None
+
+
+def plan_service(plan, ctx, m, port, notes):
+    kind, reason = service_manager(ctx)
+    manual = "%s dashboard --port %d" % (os.path.join(ctx.app_dir, "bin", "tokentier.cmd" if ctx.platform == "win32"
+                                                      else "tokentier"), port)
+    # Port check happens at planning time, BEFORE the service is (re)loaded, so a dashboard that
+    # this very install starts is never mistaken for a foreign listener.
+    st = port_state(port)
+    if st == "other":
+        plan.warnings.append(
+            "port %d on 127.0.0.1 is already used by another program (not TokenTier). The service is "
+            "installed anyway, but the dashboard cannot start until the port is free. Fix: stop the "
+            "other program, or re-run `tokentier install --port %d` (any free port). TokenTier never "
+            "kills other processes." % (port, port + 1))
+    app_changed = any(a.kind in ("write", "delete") and a.path and _under(a.path, ctx.app_dir)
+                      for a in plan.actions)
+    if kind is None:
+        notes.append("No always-on service: %s. Start the dashboard by hand with:\n    %s"
+                     % (reason, manual))
+        return
+    py = service_python()
+    if kind == "launchd":
+        path, data = launchd_plist_path(), launchd_plist(ctx.home, port, py)
+    elif kind == "schtasks":
+        path, data = task_xml_path(ctx.home), task_xml(ctx.home, port, py)
+    else:
+        path, data = systemd_unit_path(), _enc(systemd_unit(ctx.home, port, py))
+    cur = read_bytes(path)
+    changed = cur != data
+    if st == "tokentier":
+        if changed or app_changed:
+            notes.append("A TokenTier dashboard is already running on port %d; it will be restarted "
+                         "to load the new version." % port)
+        else:
+            notes.append("A TokenTier dashboard is already running on port %d; nothing changed, so "
+                         "it is left running." % port)
+    created_dirs = []
+    plan_mkdir(plan, os.path.dirname(path), created_dirs)
+    if changed:
+        plan.add(Action("write", path, data, "%s %s (%s service, port %d)"
+                        % ("create" if cur is None else "update", path, kind, port), mode=0o644))
+    prev = m.get("service") or {}
+    label = {"launchd": LAUNCHD_LABEL, "schtasks": SCHTASKS_NAME}.get(kind, SYSTEMD_UNIT)
+    m["service"] = {"kind": kind, "path": path, "sha256": sha256_bytes(data), "port": port,
+                    "python": py, "label": label,
+                    "created_dirs": sorted(set(prev.get("created_dirs", [])) | set(created_dirs)),
+                    "installed_at": prev.get("installed_at") or now_iso()}
+    if kind == "schtasks" and prev.get("kind") == "schtasks" and prev.get("runkey"):
+        m["service"]["runkey"] = prev["runkey"]  # keep the fallback record until it is cleaned up
+    plan.add(Action("cmd", desc="%s the %s service" % ("(re)load" if changed else "ensure running", kind),
+                    counts=changed, ensure={"kind": kind, "path": path, "reload": changed,
+                                            "restart": app_changed and not changed,
+                                            "svc": m["service"]}))
+
+
+def plan_config(plan, home, m, port):
+    """`install --port N` records the port in config.json (created/unchanged state goes in the
+    manifest so uninstall removes the file only if we made it and nobody touched it since)."""
+    if port is None:
+        return
+    path = cfgmod().config_path(home)
+    raw = read_bytes(path)
+    data = parse_settings(raw, path)  # aborts on invalid JSON; nothing is written
+    if raw is not None and data.get("port") == port:
+        return
+    new = dict(data)
+    new["port"] = port
+    out = dump_settings(new, json_style(raw))
+    prev = m.get("config") or {}
+    created = raw is None or (bool(prev.get("created")) and sha256_bytes(raw) == prev.get("sha256"))
+    plan.add(Action("write", path, out, "%s %s (port %d)" % ("create" if raw is None else "update", path, port),
+                    diff_old=raw if raw is not None else b"", show_diff=True, mode=None if raw is not None else 0o644))
+    m["config"] = {"path": path, "created": created, "sha256": sha256_bytes(out)}
+
+
+def _schtasks_query(ctx):
+    return run_cmd(ctx, ["schtasks", "/Query", "/TN", SCHTASKS_NAME, "/FO", "CSV", "/NH"], quiet=True)
+
+
+def _runkey_fallback(ctx, svc, why):
+    """Task Scheduler refused (e.g. access denied by policy): register the dashboard in
+    HKCU\\...\\Run (starts at the next logon) and start it now. Recorded in the manifest."""
+    py = svc.get("python") or service_python("win32")
+    port = svc.get("port") or DEFAULT_PORT
+    value = runkey_command(ctx.home, port, py)
+    try:
+        runkey_set(value)
+    except Exception as e:
+        warn("Task Scheduler failed (%s) and the HKCU Run fallback failed too (%s). Start the dashboard "
+             "by hand: %s dashboard" % (why, e, os.path.join(ctx.app_dir, "bin", "tokentier.cmd")))
+        return False
+    svc["runkey"] = {"key": "HKCU\\" + RUNKEY_PATH, "name": RUNKEY_NAME, "value": value}
+    say("  Task Scheduler could not register the task (%s)." % why)
+    say("  Fallback: added %s to HKCU\\%s; the dashboard starts at each logon." % (RUNKEY_NAME, RUNKEY_PATH))
+    if not http_health(port):
+        try:
+            start_detached(server_argv(ctx.home, port, py), cwd=ctx.home)
+        except OSError as e:
+            warn("could not start the dashboard now: %s" % e)
+    return True
+
+
+def ensure_schtasks(ctx, info):
+    svc = info.get("svc") if info.get("svc") is not None else {}
+    path, reload_ = info["path"], info["reload"]
+    if not ctx.service_exec:
+        say("  (skipped, TOKENTIER_NO_SERVICE_EXEC is set) schtasks /Create /TN \"%s\" /XML %s /F"
+            % (SCHTASKS_NAME, path))
+        say("  (skipped, TOKENTIER_NO_SERVICE_EXEC is set) schtasks /Run /TN \"%s\"" % SCHTASKS_NAME)
+        return
+    q = _schtasks_query(ctx)
+    exists = q is not None and q.returncode == 0
+    if reload_ or not exists:
+        p = run_cmd(ctx, ["schtasks", "/Create", "/TN", SCHTASKS_NAME, "/XML", path, "/F"])
+        if p is None or p.returncode != 0:
+            why = "schtasks not available" if p is None else ((p.stderr or p.stdout).strip() or
+                                                              "exit %d" % p.returncode)
+            _runkey_fallback(ctx, svc, why)
+            return
+        if svc.get("runkey"):  # an earlier fallback is no longer needed
+            try:
+                runkey_delete()
+            except Exception:
+                pass
+            svc.pop("runkey", None)
+        if reload_ and exists:
+            run_cmd(ctx, ["schtasks", "/End", "/TN", SCHTASKS_NAME], quiet=True)
+    q = _schtasks_query(ctx)
+    if q is None or q.returncode != 0 or "Running" not in q.stdout:
+        p = run_cmd(ctx, ["schtasks", "/Run", "/TN", SCHTASKS_NAME])
+        if p is not None and p.returncode != 0:
+            warn("schtasks /Run failed: %s" % (p.stderr or p.stdout).strip())
+
+
+RESTART_OK = "  dashboard restarted to load the new version"
+
+
+def _restart_failed(cmd_text):
+    warn("could not restart the dashboard; it keeps serving the old version until restarted. "
+         "Restart it by hand: %s" % cmd_text)
+
+
+def restart_service(ctx, info):
+    """Restart an already-running service so it loads the freshly written app files. Never raises:
+    a failed restart only warns."""
+    kind, path = info["kind"], info["path"]
+    if kind == "launchd":
+        target = "gui/%d/%s" % (_uid(), LAUNCHD_LABEL)
+        p = run_cmd(ctx, ["launchctl", "kickstart", "-k", target])
+        if p is not None and p.returncode == 0:
+            say(RESTART_OK)
+            return True
+        run_cmd(ctx, ["launchctl", "bootout", target])
+        p = run_cmd(ctx, ["launchctl", "bootstrap", "gui/%d" % _uid(), path])
+        if p is not None and p.returncode == 0:
+            say(RESTART_OK)
+            return True
+        _restart_failed("launchctl kickstart -k %s" % target)
+    elif kind == "systemd":
+        p = run_cmd(ctx, ["systemctl", "--user", "restart", SYSTEMD_UNIT])
+        if p is not None and p.returncode == 0:
+            say(RESTART_OK)
+            return True
+        _restart_failed("systemctl --user restart %s" % SYSTEMD_UNIT)
+    elif kind == "schtasks":
+        svc = info.get("svc") or {}
+        if svc.get("runkey"):
+            say("  the dashboard was started from the HKCU Run entry: log off and on again (or end "
+                "pythonw.exe in Task Manager and start it) to load the new version")
+            return False
+        run_cmd(ctx, ["schtasks", "/End", "/TN", SCHTASKS_NAME], quiet=True)
+        p = run_cmd(ctx, ["schtasks", "/Run", "/TN", SCHTASKS_NAME])
+        if p is not None and p.returncode == 0:
+            say(RESTART_OK)
+            return True
+        _restart_failed('schtasks /End /TN "%s" then schtasks /Run /TN "%s"' % (SCHTASKS_NAME, SCHTASKS_NAME))
+    return False
+
+
+def ensure_service(ctx, info):
+    kind, path, reload_ = info["kind"], info["path"], info["reload"]
+    restart = bool(info.get("restart")) and not reload_ and ctx.service_exec and not ctx.dry_run
+    if restart:
+        # decide BEFORE ensuring: a service that is not running is simply started with the new files
+        restart = service_running(ctx, info.get("svc") or {"kind": kind}) is True
+    if kind == "schtasks":
+        r = ensure_schtasks(ctx, info)
+        if restart:
+            restart_service(ctx, info)
+        return r
+    if kind == "launchd":
+        target = "gui/%d" % _uid()
+        loaded = run_cmd(ctx, ["launchctl", "print", "%s/%s" % (target, LAUNCHD_LABEL)], quiet=True)
+        is_loaded = loaded is not None and loaded.returncode == 0
+        if is_loaded and reload_:
+            run_cmd(ctx, ["launchctl", "bootout", "%s/%s" % (target, LAUNCHD_LABEL)])
+            is_loaded = False
+        if not is_loaded:
+            p = run_cmd(ctx, ["launchctl", "bootstrap", target, path])
+            if p is not None and p.returncode != 0:
+                warn("launchctl bootstrap failed: %s" % (p.stderr or p.stdout).strip())
+    else:
+        run_cmd(ctx, ["systemctl", "--user", "daemon-reload"])
+        p = run_cmd(ctx, ["systemctl", "--user", "enable", "--now", SYSTEMD_UNIT])
+        if p is not None and p.returncode != 0:
+            warn("systemctl enable failed: %s" % (p.stderr or p.stdout).strip())
+        elif reload_:
+            run_cmd(ctx, ["systemctl", "--user", "restart", SYSTEMD_UNIT])
+    if restart:
+        restart_service(ctx, info)
+
+
+def stop_service(ctx, svc):
+    kind = svc.get("kind")
+    if kind == "launchd":
+        run_cmd(ctx, ["launchctl", "bootout", "gui/%d/%s" % (_uid(), LAUNCHD_LABEL)])
+    elif kind == "systemd":
+        run_cmd(ctx, ["systemctl", "--user", "disable", "--now", SYSTEMD_UNIT])
+    elif kind == "schtasks":
+        run_cmd(ctx, ["schtasks", "/End", "/TN", SCHTASKS_NAME])
+        run_cmd(ctx, ["schtasks", "/Delete", "/TN", SCHTASKS_NAME, "/F"])
+        if svc.get("runkey"):
+            if not ctx.service_exec:
+                say("  (skipped, TOKENTIER_NO_SERVICE_EXEC is set) delete HKCU\\%s value %s"
+                    % (RUNKEY_PATH, RUNKEY_NAME))
+            else:
+                try:
+                    runkey_delete()
+                except Exception as e:
+                    warn("could not remove HKCU\\%s value %s: %s (remove it with regedit)"
+                         % (RUNKEY_PATH, RUNKEY_NAME, e))
+                say("  note: the dashboard started from the Run entry keeps running until you log off "
+                    "(or end pythonw.exe in Task Manager); it will not start again.")
+
+
+def service_label(svc):
+    """Human name of the service kind for status/doctor."""
+    k = (svc or {}).get("kind")
+    if k == "schtasks":
+        return "scheduled task" + (" (fallback: HKCU Run entry)" if svc.get("runkey") else "")
+    return k
+
+
+def service_running(ctx, svc):
+    """True/False/None(unknown)."""
+    if not svc or not ctx.service_exec:
+        return None
+    if svc.get("kind") == "schtasks":
+        # schtasks output is localised; "Running" is a hint, the HTTP health probe is the truth
+        healthy = bool(http_health(svc.get("port") or DEFAULT_PORT))
+        q = _schtasks_query(ctx)
+        if q is None:
+            return healthy or None
+        return healthy or (q.returncode == 0 and "Running" in q.stdout)
+    if svc.get("kind") == "launchd":
+        p = run_cmd(ctx, ["launchctl", "print", "gui/%d/%s" % (_uid(), LAUNCHD_LABEL)], quiet=True)
+        if p is None:
+            return None
+        return p.returncode == 0 and "state = running" in p.stdout
+    if svc.get("kind") == "systemd":
+        p = run_cmd(ctx, ["systemctl", "--user", "is-active", SYSTEMD_UNIT], quiet=True)
+        return None if p is None else p.stdout.strip() == "active"
+    return None
+
+
+# ---------------------------------------------------------------- execution
+def show_plan(plan, header):
+    say(header)
+    for a in plan.actions:
+        if a.kind == "backup":
+            say("  backup  %s" % a.path)
+        elif a.kind == "cmd":
+            say("  service %s" % a.desc)
+            if a.ensure and a.ensure.get("restart") and (plan.ctx.dry_run or plan.ctx.service_exec):
+                say("  service: will restart (app files changed)")
+        else:
+            say("  %-7s %s" % (a.kind, a.desc or a.path))
+    for n in plan.notes:
+        say("  note: %s" % n)
+    for w in plan.warnings:
+        warn(w)
+
+
+def show_diffs(plan):
+    for a in plan.actions:
+        if a.show_diff and a.kind in ("write", "delete"):
+            old = _dec(a.diff_old or b"").splitlines(True)
+            new = _dec(a.data or b"").splitlines(True) if a.kind == "write" else []
+            d = list(difflib.unified_diff(old, new, a.path + " (now)", a.path + " (after)"))
+            if d:
+                say("")
+                for l in d:
+                    sys.stdout.write(l if l.endswith("\n") else l + "\n\\ No newline at end of file\n")
+                sys.stdout.flush()
+
+
+def confirm(args, question="Proceed?"):
+    if getattr(args, "yes", False):
+        return True
+    if not sys.stdin or not sys.stdin.isatty():
+        raise Abort("not running in a terminal; re-run with --yes to confirm (or --dry-run to preview)")
+    try:
+        ans = input("%s [y/N] " % question)
+    except EOFError:
+        ans = ""
+    return ans.strip().lower() in ("y", "yes")
+
+
+def execute(plan, ctx):
+    for a in plan.actions:
+        if a.kind in ("write", "backup"):
+            mode = a.mode
+            atomic_write(a.path, a.data, mode)
+        elif a.kind == "copy":
+            data = read_bytes(a.src)
+            atomic_write(a.path, data, a.mode)
+        elif a.kind == "mkdir":
+            os.makedirs(a.path, exist_ok=True)
+        elif a.kind == "delete":
+            unlink_retry(a.path)
+        elif a.kind == "rmdir":
+            try:
+                os.rmdir(a.path)
+            except OSError:
+                pass  # not empty any more: leave it
+        elif a.kind == "rmtree":
+            shutil.rmtree(a.path, ignore_errors=True)
+        elif a.kind == "cmd":
+            if a.ensure:
+                ensure_service(ctx, a.ensure)
+            elif a.cmd:
+                a.cmd(ctx)
+
+
+# ------------------------------------------------------------------ install
+def cmd_shim(python):
+    """bin/tokentier.cmd: runs bin/tokentier (next to it) with the installer's python.exe."""
+    text = '@"%s" "%%~dp0tokentier" %%*\r\n' % python
+    if os.name == "nt":
+        try:
+            return text.encode("oem")  # cmd.exe reads .cmd files in the OEM code page
+        except (UnicodeEncodeError, LookupError):
+            pass
+    return text.encode("utf-8")
+
+
+def cmd_install(args):
+    src = Source(ROOT)
+    src.check()
+    home = resolve_home(args.home)
+    ctx = Ctx(home, args.dry_run)
+    old = load_manifest(home)
+    m = copy.deepcopy(old) if old else new_manifest(home)
+    plan = Plan(ctx)
+    is_project = args.project is not None
+    gclaude = default_claude_dir()
+    if is_project:
+        project_dir = os.path.abspath(os.path.expanduser(args.project))
+        if not os.path.isdir(project_dir):
+            raise Abort("project dir %s does not exist" % project_dir)
+        claude_dir = os.path.abspath(os.path.expanduser(args.claude_dir)) if args.claude_dir \
+            else os.path.join(project_dir, ".claude")
+        md_path = os.path.join(project_dir, "CLAUDE.md")
+        if same_path(claude_dir, gclaude):
+            raise Abort("%s is the global Claude Code config dir; run the install without --project "
+                        "for a global install" % claude_dir)
+    else:
+        project_dir = None
+        claude_dir = os.path.abspath(os.path.expanduser(args.claude_dir)) if args.claude_dir else gclaude
+        md_path = os.path.join(claude_dir, "CLAUDE.md")
+    settings_path = os.path.join(claude_dir, "settings.json")
+    if args.port is not None and not 1 <= args.port <= 65535:
+        raise Abort("--port must be 1-65535 (got %d)" % args.port)
+    port = effective_port(home, args.port, m)
+
+    # 1. tokentier home + app copy
+    plan_mkdir(plan, home)
+    plan_mkdir(plan, ctx.logs)
+    app_files = m["app"]["files"]
+    if not same_path(src.root, ctx.app_dir) or not os.path.isdir(ctx.app_dir):
+        new_rel = set()
+        for rel, path in src.app_files():
+            new_rel.add(rel)
+            dest = os.path.join(ctx.app_dir, rel)
+            data = read_bytes(path)
+            cur = read_bytes(dest)
+            mode = 0o755 if rel in ("bin/tokentier", "hooks/tokentier_log.py") else 0o644
+            if rel == PRICING_REL:
+                prev = app_files.get(rel)
+                if cur is not None and cur != data and not (prev and sha256_bytes(cur) == prev):
+                    plan.notes.append("%s was edited by you; kept it. The new default pricing is "
+                                      "written next to it as pricing.json.new" % dest)
+                    if read_bytes(dest + ".new") != data:
+                        plan.add(Action("write", dest + ".new", data, "create %s.new" % dest, mode=0o644))
+                    app_files[rel] = sha256_bytes(data)
+                    m["app"]["pricing_user_edited"] = True
+                    continue
+                m["app"].pop("pricing_user_edited", None)
+            if cur != data:
+                plan.add(Action("write", dest, data, "%s %s" % ("create" if cur is None else "update", dest),
+                                mode=mode))
+            app_files[rel] = sha256_bytes(data)
+        if ctx.platform == "win32":
+            new_rel.add(SHIM_REL)  # generated below, not copied
+        for rel in sorted(set(app_files) - new_rel):
+            dest = os.path.join(ctx.app_dir, rel)
+            if sha256_file(dest) == app_files[rel]:
+                plan.add(Action("delete", dest, desc="remove obsolete %s" % dest))
+            app_files.pop(rel)
+    if ctx.platform == "win32":
+        # tokentier.cmd next to bin/tokentier, so `tokentier` works from cmd/PowerShell once the
+        # bin dir is on PATH (we never edit PATH ourselves)
+        dest = os.path.join(ctx.app_dir, *SHIM_REL.split("/"))
+        data = cmd_shim(hook_python())
+        if read_bytes(dest) != data:
+            plan.add(Action("write", dest, data, "%s %s (Windows command shim)"
+                            % ("create" if read_bytes(dest) is None else "update", dest), mode=0o755))
+        app_files[SHIM_REL] = sha256_bytes(data)
+    m["app"]["dir"] = ctx.app_dir
+
+    # 2. scope (global or project)
+    if is_project:
+        rec = find_project(m, project_dir)
+        if rec is None:
+            rec = {"scope": "project", "project_dir": project_dir, "claude_dir": claude_dir,
+                   "installed_at": None, "created_dirs": [], "files": {}, "claude_md": {}, "settings": {}}
+            m["projects"].append(rec)
+    else:
+        rec = m.get("global") or {"scope": "global", "project_dir": None, "claude_dir": claude_dir,
+                                  "installed_at": None, "created_dirs": [], "files": {}, "claude_md": {},
+                                  "settings": {}}
+        m["global"] = rec
+    rec["claude_dir"] = claude_dir
+    for d in (claude_dir, os.path.join(claude_dir, "agents"), os.path.join(claude_dir, "skills"),
+              os.path.join(claude_dir, "skills", "model-router")):
+        plan_mkdir(plan, d, rec["created_dirs"])
+    for name in AGENT_FILES:
+        plan_kit_file(plan, os.path.join(claude_dir, "agents", name), src.agent(name), rec["files"],
+                      "agent")
+    plan_kit_file(plan, os.path.join(claude_dir, "skills", "model-router", "SKILL.md"), src.skill(),
+                  rec["files"], "skill")
+    plan_claude_md(plan, md_path, src.snippet(), rec["claude_md"])
+
+    # 3. hooks, with the double-logging guard
+    add_hooks, reason = True, None
+    if args.no_hooks:
+        add_hooks, reason = False, "--no-hooks"
+    elif is_project:
+        g = m.get("global") or {}
+        global_counts, _ = count_our_hooks(os.path.join(gclaude, "settings.json"))
+        if (g.get("settings") or {}).get("entries") or any(global_counts.values()):
+            add_hooks = False
+            reason = "global TokenTier hooks are already installed"
+            if not (rec.get("settings") or {}).get("entries"):
+                plan.notes.append(
+                    "Not adding hooks to %s: global TokenTier hooks are already installed and Claude Code "
+                    "runs user-level and project-level hooks together, so every event would be logged "
+                    "twice. Agents, skill and CLAUDE.md are still installed in this project; logging "
+                    "already works here through the global hooks." % settings_path)
+    else:
+        dup = [p["project_dir"] for p in m.get("projects", []) if (p.get("settings") or {}).get("entries")]
+        for d in dup:
+            plan.warnings.append(
+                "project %s has its own TokenTier hooks; with global hooks too, its events would be "
+                "logged twice. Fix: tokentier uninstall --project %s --hooks-only"
+                % (d, shell_quote(d, ctx.platform)))
+    plan_settings(plan, settings_path, home, rec["settings"], add_hooks, reason)
+
+    # 4. service
+    svc_notes = []
+    if args.no_service:
+        if not m.get("service"):
+            svc_notes.append("--no-service: no always-on dashboard. Start it when needed with:\n    %s "
+                             "dashboard" % os.path.join(ctx.app_dir, "bin", "tokentier.cmd"
+                                                        if ctx.platform == "win32" else "tokentier"))
+        else:
+            svc_notes.append("--no-service: the existing service (%s) is left as it is"
+                             % m["service"].get("path"))
+    else:
+        plan_service(plan, ctx, m, port, svc_notes)
+    plan.notes.extend(svc_notes)
+
+    # 5. config.json (only when --port was given)
+    plan_config(plan, home, m, args.port)
+
+    changes = plan.changes()
+    stamp = now_iso()
+    scope_label = "project %s" % project_dir if is_project else "global (%s)" % claude_dir
+    header = "TokenTier %s install plan, scope: %s\n  tokentier home: %s" % (src.version, scope_label, home)
+    if not changes and old is not None and _strip_times(old) == _strip_times(m):
+        say(header)
+        for w in plan.warnings:
+            warn(w)
+        say("Nothing to do: TokenTier %s is already installed and up to date." % src.version)
+        if not args.dry_run:
+            execute(plan, ctx)  # only 'ensure service running' commands remain
+            if m != old:
+                save_manifest(home, m)  # e.g. a Windows Run-key fallback was recorded
+        return 0
+    show_plan(plan, header)
+    if args.dry_run:
+        show_diffs(plan)
+        say("\nDry run: nothing was written.")
+        return 0
+    if not args.yes:
+        show_diffs(plan)
+        if not confirm(args):
+            say("Cancelled. Nothing was written.")
+            return 1
+    m["version"] = src.version
+    m["installed_at"] = m.get("installed_at") or stamp
+    m["updated_at"] = stamp
+    m["tokentier_home"] = home
+    rec["installed_at"] = rec.get("installed_at") or stamp
+    rec["updated_at"] = stamp
+    for a in plan.actions:
+        if a.kind == "backup":
+            m["backups"].append({"backup": a.path, "at": stamp})
+    try:
+        execute(plan, ctx)
+    except BaseException as e:
+        m["incomplete"] = "install interrupted: %s" % e
+        save_manifest(home, m)
+        raise
+    m.pop("incomplete", None)
+    save_manifest(home, m)
+    say("")
+    say("Installed TokenTier %s (%s)." % (src.version, scope_label))
+    hs = rec["settings"]
+    if hs.get("entries"):
+        say("  hooks: registered in %s" % settings_path)
+    else:
+        say("  hooks: not added (%s)" % hs.get("hooks_skipped"))
+    say("  logs:  %s" % ctx.logs)
+    if m.get("service"):
+        say("  dashboard: http://127.0.0.1:%d/ (always-on %s service)" % (m["service"]["port"],
+                                                                        service_label(m["service"])))
+    bindir = os.path.join(ctx.app_dir, "bin")
+    if ctx.platform == "win32":
+        shim = os.path.join(bindir, "tokentier.cmd")
+        say("  CLI:   %s" % shim)
+        say("  PATH tip: to type just `tokentier`, add %s to your user PATH (Start > \"Edit environment "
+            "variables for your account\" > Path > New). TokenTier does not change PATH for you." % bindir)
+        say("  hooks run as: %s %s <Event> (exec form, needs Claude Code %s or newer)"
+            % (fwd(hook_python()), fwd(os.path.join(home, "app", "hooks", "tokentier_log.py")),
+               MIN_CLAUDE_EXEC_FORM))
+        say("Restart Claude Code, then run /agents to see fast-worker, mid-worker and deep-worker.")
+        say("Check everything with: %s doctor" % subprocess.list2cmdline([shim]))
+        return 0
+    say("  CLI:   %s  (tip: alias tokentier=%s)" % (os.path.join(bindir, "tokentier"),
+                                                  shlex.quote(os.path.join(bindir, "tokentier"))))
+    say("Restart Claude Code, then run /agents to see fast-worker, mid-worker and deep-worker.")
+    say("Check everything with: %s doctor" % os.path.join(bindir, "tokentier"))
+    return 0
+
+
+def _strip_times(m):
+    m = copy.deepcopy(m)
+
+    def walk(o):
+        if isinstance(o, dict):
+            for k in ("installed_at", "updated_at"):
+                o.pop(k, None)
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+    walk(m)
+    return m
+
+
+# ---------------------------------------------------------------- uninstall
+def plan_uninstall_scope(plan, rec, home, hooks_only, report, keep_backups):
+    sres = rec.get("settings") or {}
+    path = sres.get("path")
+    if path and sres.get("entries"):
+        raw = read_bytes(path)
+        if raw is None:
+            report.append("%s no longer exists; no hook entries to remove" % path)
+        else:
+            data = parse_settings(raw, path)
+            new = copy.deepcopy(data)
+            hooks = new.get("hooks") if isinstance(new.get("hooks"), dict) else {}
+            for ent in sres["entries"]:
+                lst = hooks.get(ent["event"])
+                if isinstance(lst, list) and ent["group"] in lst:
+                    lst.remove(ent["group"])
+                elif our_hook_refs(lst):
+                    report.append("%s: the TokenTier %s hook was modified by you; left it in place"
+                                  % (path, ent["event"]))
+                else:
+                    report.append("%s: TokenTier %s hook not found (already removed?)" % (path, ent["event"]))
+            recorded = set(e.get("event") for e in sres["entries"])
+            for ev in HOOK_EVENTS:
+                # entries of an OLDER manifest lack events added later (Stop): remove our exact entry anyway
+                lst = hooks.get(ev)
+                if ev not in recorded and isinstance(lst, list):
+                    g = hook_group(ev, home)
+                    if g in lst:
+                        lst.remove(g)
+                        if not lst and ev in NO_MATCHER_EVENTS:
+                            del hooks[ev]
+            for ev in sres.get("created_events", []):
+                if hooks.get(ev) == []:
+                    del hooks[ev]
+            if sres.get("created_hooks_key") and new.get("hooks") == {}:
+                del new["hooks"]
+            orig = read_bytes(sres["backup_original"]) if sres.get("backup_original") else None
+            orig_data = None
+            if orig is not None:
+                try:
+                    orig_data = parse_settings(orig, sres["backup_original"])
+                except SettingsError:
+                    orig_data = None
+            if new == data:
+                pass
+            elif orig is not None and orig_data == new:
+                plan.add(Action("write", path, orig, "restore %s (original bytes)" % path,
+                                diff_old=raw, show_diff=True))
+            elif sres.get("created_file") and new == {}:
+                plan.add(Action("delete", path, desc="delete %s (created by TokenTier, now empty)" % path,
+                                diff_old=raw, show_diff=True))
+            else:
+                plan.add(Action("write", path, dump_settings(new, json_style(raw)),
+                                "update %s (remove TokenTier hook entries)" % path,
+                                diff_old=raw, show_diff=True))
+                if sres.get("backup_original"):
+                    keep_backups.append(sres["backup_original"])  # not byte-restored: keep the original
+    if hooks_only:
+        return
+    line = Source(ROOT).snippet() if os.path.isdir(os.path.join(ROOT, "kit")) else DEFAULT_SNIPPET
+    cm = rec.get("claude_md") or {}
+    if cm.get("state") == "added" and cm.get("path"):
+        raw = read_bytes(cm["path"])
+        if raw is not None:
+            text = _dec(raw)
+            new, note = claude_md_remove(text, cm, line)
+            if note:
+                report.append("%s: %s" % (cm["path"], note))
+            if cm.get("created_file") and new.strip() == "":
+                plan.add(Action("delete", cm["path"], desc="delete %s (created by TokenTier, now empty)"
+                                % cm["path"], diff_old=raw, show_diff=True))
+            elif new != text:
+                plan.add(Action("write", cm["path"], _enc(new), "update %s (remove tokentier block)"
+                                % cm["path"], diff_old=raw, show_diff=True))
+    for dest, r in sorted((rec.get("files") or {}).items()):
+        cur = read_bytes(dest)
+        if cur is None:
+            if r.get("backup"):
+                b = read_bytes(r["backup"])
+                if b is not None:
+                    plan.add(Action("write", dest, b, "restore %s from backup" % dest))
+            continue
+        if sha256_bytes(cur) != r.get("sha256"):
+            report.append("%s was changed after install; left in place" % dest)
+            if r.get("backup"):
+                keep_backups.append(r["backup"])
+            continue
+        if r.get("backup"):
+            b = read_bytes(r["backup"])
+            if b is None:
+                report.append("backup %s is missing; left %s in place" % (r["backup"], dest))
+                continue
+            plan.add(Action("write", dest, b, "restore %s from backup" % dest))
+        elif r.get("created"):
+            plan.add(Action("delete", dest, desc="delete %s" % dest))
+    for d in sorted(rec.get("created_dirs") or [], key=len, reverse=True):
+        plan.add(Action("rmdir", d, desc="remove dir %s (if empty)" % d))
+
+
+HOME_INTERNAL_FILES = ("dashboard.log", "hook-errors.log", "hook-ignored.log", "routing-hints.json",
+                       TASK_XML_NAME)
+
+
+def check_purge_home(home):
+    """Refuse to delete a whole directory tree that does not clearly belong to TokenTier."""
+    h = os.path.abspath(home) if home else ""
+    if not h or os.path.dirname(h) == h:
+        raise Abort("refusing to --purge: the TokenTier home %r is empty or a filesystem root" % home)
+    real = os.path.normcase(os.path.realpath(h))
+    for g in (home_dir(), default_claude_dir()):
+        gr = os.path.normcase(os.path.realpath(g))
+        if real == gr or gr.startswith(real + os.sep):
+            raise Abort("refusing to --purge: %s is (or contains) %s, which is not a TokenTier folder" % (h, g))
+    if os.path.basename(h) != ".tokentier" and not (
+            os.path.isfile(manifest_path(h)) and os.path.isdir(os.path.join(h, "app"))):
+        raise Abort("refusing to --purge: %s is not named .tokentier and has no TokenTier manifest and app "
+                    "folder. Delete it by hand if you are sure." % h)
+
+
+def cmd_uninstall(args):
+    home = resolve_home(args.home)
+    if args.purge and args.project is None and not args.hooks_only:
+        if args.keep_service:
+            raise Abort("--purge cannot be combined with --keep-service (purge deletes the app folder too)")
+        check_purge_home(home)
+    ctx = Ctx(home, args.dry_run)
+    m = load_manifest(home)
+    if m is None:
+        raise Abort("TokenTier is not installed in %s (no %s). Nothing to do."
+                    % (home, MANIFEST_NAME))
+    plan = Plan(ctx)
+    report, keep_backups = [], []
+    if args.project is not None:
+        pdir = os.path.abspath(os.path.expanduser(args.project))
+        rec = find_project(m, pdir)
+        if rec is None:
+            known = [p["project_dir"] for p in m.get("projects", [])] or ["(none)"]
+            raise Abort("no TokenTier install recorded for project %s. Recorded projects: %s"
+                        % (pdir, ", ".join(known)))
+        scopes = [rec]
+        full = False
+    elif args.hooks_only:
+        if not m.get("global"):
+            raise Abort("no global TokenTier install recorded; use --project DIR --hooks-only")
+        scopes = [m["global"]]
+        full = False
+    else:
+        scopes = ([m["global"]] if m.get("global") else []) + list(m.get("projects", []))
+        full = True
+    for rec in scopes:
+        plan_uninstall_scope(plan, rec, home, args.hooks_only, report, keep_backups)
+
+    if full:
+        svc = m.get("service")
+        if svc and not args.keep_service:
+            plan.add(Action("cmd", desc="stop and unregister the %s service" % svc.get("kind"),
+                            cmd=lambda c, s=svc: stop_service(c, s)))
+            if svc.get("path"):
+                plan.add(Action("delete", svc["path"], desc="delete %s" % svc["path"]))
+            if svc.get("kind") == "systemd":
+                plan.add(Action("cmd", desc="systemctl --user daemon-reload",
+                                cmd=lambda c: run_cmd(c, ["systemctl", "--user", "daemon-reload"])))
+            for d in sorted(svc.get("created_dirs") or [], key=len, reverse=True):
+                plan.add(Action("rmdir", d, desc="remove dir %s (if empty)" % d))
+        if not args.keep_service:
+            pr = os.path.join(ctx.app_dir, PRICING_REL)
+            cur = read_bytes(pr)
+            if cur is not None and sha256_bytes(cur) != m["app"]["files"].get(PRICING_REL) \
+                    and not args.purge:
+                keep = os.path.join(home, "pricing.json.user-edited")
+                plan.add(Action("write", keep, cur, "keep your edited pricing as %s" % keep))
+                report.append("your edited pricing.json was kept as %s" % keep)
+            if os.path.isdir(ctx.app_dir):
+                plan.add(Action("rmtree", ctx.app_dir, desc="remove %s" % ctx.app_dir))
+            # internal / derived files TokenTier created in its home (never the user's logs/)
+            sdir = os.path.join(home, "state")
+            if os.path.isdir(sdir):
+                plan.add(Action("rmtree", sdir, desc="remove %s (internal per-session state)" % sdir))
+            planned = set(a.path for a in plan.actions if a.kind == "delete")
+            for fn in HOME_INTERNAL_FILES:
+                p = os.path.join(home, fn)
+                if os.path.exists(p) and p not in planned:
+                    plan.add(Action("delete", p, desc="delete %s" % p))
+            bdir = os.path.join(home, "backups")
+            if os.path.isdir(bdir):
+                if keep_backups:
+                    report.append("kept %s because some files could not be restored" % bdir)
+                else:
+                    plan.add(Action("rmtree", bdir, desc="remove %s (originals restored)" % bdir))
+            cp = cfgmod().config_path(home)
+            ccur = read_bytes(cp)
+            crec = m.get("config") or {}
+            if ccur is not None:
+                if crec.get("created") and sha256_bytes(ccur) == crec.get("sha256"):
+                    plan.add(Action("delete", cp, desc="delete %s (created by the installer, unchanged)" % cp))
+                else:
+                    report.append("kept %s (%s)" % (cp, "you changed it since the install" if crec.get("created")
+                                                    else "it was not created by the installer"))
+            plan.add(Action("delete", manifest_path(home), desc="delete %s" % manifest_path(home)))
+        if args.purge:
+            plan.add(Action("rmtree", home, desc="PURGE the whole TokenTier folder %s (logs, config, everything)"
+                            % home))
+        elif not args.keep_service:
+            plan.add(Action("cmd", desc="remove %s if empty" % home,
+                            cmd=lambda c: _rmdir_quiet(home), counts=False))
+
+    what = ("project %s" % scopes[0]["project_dir"]) if args.project is not None else \
+        ("global hooks only" if args.hooks_only else "everything (global + %d project(s))"
+         % len(m.get("projects", [])))
+    show_plan(plan, "TokenTier uninstall plan: %s\n  tokentier home: %s" % (what, home))
+    for r in report:
+        say("  note: %s" % r)
+    if full and not args.purge:
+        say("  keep    %s (your logs; use --purge to delete them)" % ctx.logs)
+    if full and args.purge:
+        try:
+            left = sorted(os.listdir(home))
+        except OSError:
+            left = []
+        say("  the whole folder %s will be deleted. It currently holds: %s" % (home, ", ".join(left) or "(empty)"))
+    if args.dry_run:
+        show_diffs(plan)
+        say("\nDry run: nothing was changed.")
+        return 0
+    if not args.yes:
+        show_diffs(plan)
+        if not confirm(args):
+            say("Cancelled. Nothing was changed.")
+            return 1
+    if args.purge and not args.yes:
+        if not confirm(args, "Really delete the WHOLE TokenTier folder %s, including logs? This cannot be undone." % home):
+            say("Cancelled. Nothing was changed.")
+            return 1
+    execute(plan, ctx)
+    # manifest bookkeeping
+    if full and not args.keep_service:
+        pass  # manifest deleted
+    else:
+        stamp = now_iso()
+        if args.project is not None and not args.hooks_only:
+            m["projects"] = [p for p in m["projects"] if p is not scopes[0]]
+        elif args.hooks_only:
+            for rec in scopes:
+                rec["settings"]["entries"] = []
+                rec["settings"]["hooks_skipped"] = "removed by uninstall --hooks-only"
+                rec["updated_at"] = stamp
+        elif full:  # --keep-service
+            m["global"] = None
+            m["projects"] = []
+        m["updated_at"] = stamp
+        save_manifest(home, m)
+    say("")
+    if args.hooks_only and args.project is not None:
+        say("Removed the TokenTier hooks from project %s. Its agents, skill and CLAUDE.md line were kept."
+            % scopes[0]["project_dir"])
+    elif args.hooks_only:
+        say("Removed the global TokenTier hooks. The agents, skill and CLAUDE.md line were kept.")
+    else:
+        say("Uninstalled: %s." % what)
+    if full and not args.purge:
+        say("Your logs are still in %s (delete with `tokentier uninstall --purge`, or by hand)." % ctx.logs)
+    return 0
+
+
+def _rmdir_quiet(p):
+    try:
+        os.rmdir(p)
+    except OSError:
+        pass
+
+
+# ------------------------------------------------------------- status/doctor
+def iter_log_lines(logs):
+    for p in sorted(glob.glob(os.path.join(logs, "*.jsonl"))):
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if line.strip():
+                        yield p, line
+        except OSError:
+            continue
+
+
+def _parse_ts(s):
+    if not isinstance(s, str) or not s:
+        return None
+    s = s.strip()
+    if s[-1:] in ("Z", "z"):
+        s = s[:-1] + "+00:00"
+    m = re.match(r"^(.*?T\d{2}:\d{2}:\d{2})(\.\d+)?(.*)$", s)
+    if m:
+        s = m.group(1) + "." + (((m.group(2) or "")[1:] + "000000")[:6]) + m.group(3)
+    try:
+        d = _dt.datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=_dt.timezone.utc)
+
+
+def log_stats(logs):
+    files = len(glob.glob(os.path.join(logs, "*.jsonl")))
+    events, latest, latest_raw = 0, None, None
+    for _, line in iter_log_lines(logs):
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        events += 1
+        d = _parse_ts(ev.get("ts")) if isinstance(ev, dict) else None
+        if d and (latest is None or d > latest):
+            latest, latest_raw = d, ev.get("ts")
+    return files, events, latest_raw
+
+
+def all_scopes(m):
+    out = []
+    if m and m.get("global"):
+        out.append(m["global"])
+    if m:
+        out.extend(m.get("projects", []))
+    return out
+
+
+def cmd_status(args):
+    home = resolve_home(args.home)
+    ctx = Ctx(home)
+    m = load_manifest(home)
+    say("TokenTier status")
+    say("  cli version      : %s" % read_version())
+    if not m:
+        say("  installed        : no (no manifest in %s)" % home)
+    else:
+        say("  installed version: %s (updated %s)" % (m.get("version"), m.get("updated_at")))
+        say("  tokentier home   : %s" % home)
+        for rec in all_scopes(m):
+            label = "global" if rec["scope"] == "global" else "project %s" % rec["project_dir"]
+            sp = (rec.get("settings") or {}).get("path") or os.path.join(rec["claude_dir"], "settings.json")
+            counts, err = count_our_hooks(sp)
+            n = sum(counts.values())
+            if err:
+                hooks = "settings.json unreadable"
+            elif n:
+                hooks = "registered (%d/%d events)" % (sum(1 for v in counts.values() if v), len(HOOK_EVENTS))
+            else:
+                hooks = "not registered" + (" (%s)" % rec["settings"]["hooks_skipped"]
+                                            if (rec.get("settings") or {}).get("hooks_skipped") else "")
+            say("  scope            : %s, hooks %s" % (label, hooks))
+    svc = (m or {}).get("service")
+    port = effective_port(home, args.port, m)
+    if svc:
+        run = service_running(ctx, svc)
+        say("  service          : %s (%s), running: %s" % (
+            service_label(svc), svc["path"], {True: "yes", False: "no", None: "unknown"}[run]
+            + (" (service checks disabled by TOKENTIER_NO_SERVICE_EXEC)" if run is None and not ctx.service_exec
+               else "")))
+    else:
+        say("  service          : not installed")
+    h = http_health(port)
+    url = "http://127.0.0.1:%d/" % port
+    if h:
+        say("  dashboard        : %s  (HTTP OK, version %s)" % (url, h.get("version")))
+    else:
+        st = port_state(port)
+        say("  dashboard        : %s  (not answering%s)" % (
+            url, "; port used by another program" if st == "other" else ""))
+    files, events, latest = log_stats(ctx.logs)
+    say("  log dir          : %s" % ctx.logs)
+    say("  log files/events : %d files, %d events" % (files, events))
+    say("  latest event     : %s" % (latest or "none yet"))
+    return 0
+
+
+class Doctor(object):
+    def __init__(self):
+        self.rows = []
+
+    def add(self, level, name, msg, fix=None):
+        self.rows.append((level, name, msg, fix))
+
+    def print(self):
+        for level, name, msg, fix in self.rows:
+            say("%-4s %-22s %s" % (level, name, msg))
+            if fix and level != "PASS":
+                say("     %-22s fix: %s" % ("", fix))
+        fails = sum(1 for r in self.rows if r[0] == "FAIL")
+        warns = sum(1 for r in self.rows if r[0] == "WARN")
+        say("\n%d checks: %d FAIL, %d WARN" % (len(self.rows), fails, warns))
+        return 1 if fails else 0
+
+
+def run_hook_selftest(hook, python="python3"):
+    """Fire a synthetic SessionStart through the hook script into a temp home. `python` is what the
+    registered hooks use: `python3` on macOS/Linux, the absolute interpreter on Windows."""
+    tmp = tempfile.mkdtemp(prefix="tokentier-doctor-")
+    try:
+        env = dict(os.environ, TOKENTIER_HOME=tmp)
+        env.pop("CLAUDE_PROJECT_DIR", None)
+        payload = json.dumps({"session_id": "tokentier-doctor", "cwd": tmp,
+                              "hook_event_name": "SessionStart", "source": "startup"})
+        p = subprocess.run([python, hook, "SessionStart"], input=payload, env=env,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+                           timeout=20)
+        lines = [json.loads(l) for _, l in iter_log_lines(os.path.join(tmp, "logs"))]
+        ok = p.returncode == 0 and len(lines) == 1 and lines[0].get("event") == "session_start"
+        return ok, "exit %d, %d event(s) logged" % (p.returncode, len(lines))
+    except Exception as e:
+        return False, str(e)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def doctor_config(d, home):
+    c = cfgmod()
+    path = c.config_path(home)
+    if not os.path.exists(path):
+        d.add("PASS", "config", "no %s (built-in defaults; see `tokentier config list`)" % path)
+        return
+    data, err = c.read_config(home)
+    if err:
+        d.add("FAIL", "config", err, "fix the JSON, or `tokentier config unset KEY`, or delete the file")
+        return
+    errors, unknown = c.check_config(data)
+    for k, msg in errors:
+        d.add("FAIL", "config", "%s: %s" % (k, msg), "tokentier config set %s VALUE (or unset %s)" % (k, k))
+    for k in unknown:
+        if k == "host":
+            d.add("WARN", "config", "unknown key \"host\": ignored, the dashboard always binds 127.0.0.1",
+                  "tokentier config unset host")
+        else:
+            d.add("WARN", "config", "unknown key %r (ignored; valid keys: %s)" % (k, ", ".join(c.KEY_ORDER)),
+                  "tokentier config unset %s" % k)
+    if not errors and not unknown:
+        d.add("PASS", "config", "%s is valid (%d key%s)" % (path, len(data), "" if len(data) == 1 else "s"))
+
+
+def doctor_hook_form(d, paths, win):
+    """Exec-form (Windows) entries must point at an existing interpreter; on Windows the POSIX
+    shell form (`python3 ...` via Git Bash) is flagged so a re-install converts it."""
+    handlers = [h for p in paths for h in our_handlers(p)]
+    if not handlers:
+        return
+    exec_form = [h for h in handlers if isinstance(h.get("args"), list)]
+    missing = sorted(set(h["command"] for h in exec_form if not os.path.isfile(str(h.get("command")))))
+    if missing:
+        d.add("FAIL", "hook python", "interpreter in the hook entries not found: %s" % ", ".join(missing),
+              "re-run the installer with a working Python 3.9+")
+    elif exec_form:
+        d.add("PASS", "hook python", "%s (exec form, needs Claude Code %s+)"
+              % (", ".join(sorted(set(h["command"] for h in exec_form))), MIN_CLAUDE_EXEC_FORM))
+    if win and len(exec_form) < len(handlers):
+        d.add("WARN", "hook form", "%d TokenTier hook(s) use the macOS/Linux command form, which needs "
+              "`python3` in Git Bash" % (len(handlers) - len(exec_form)), "re-run install to convert them")
+
+
+def cmd_doctor(args):
+    home = resolve_home(args.home)
+    ctx = Ctx(home)
+    d = Doctor()
+    win = ctx.platform == "win32"
+    tt = os.path.join(home, "app", "bin", "tokentier.cmd" if win else "tokentier")
+    v = sys.version_info
+    d.add("PASS" if v >= (3, 9) else "FAIL", "python", "%d.%d.%d (%s)" % (v[0], v[1], v[2], sys.executable),
+          "install Python 3.9+")
+    if win:
+        pass  # Windows hooks run an absolute python.exe (checked under "hook python" below)
+    elif not shutil.which("python3"):
+        d.add("FAIL", "python3 on PATH", "python3 not found on PATH; hooks run `python3 ...`",
+              "install python3 or add it to PATH")
+    try:
+        m = load_manifest(home)
+    except Abort as e:
+        d.add("FAIL", "manifest", str(e), "move the manifest aside and re-run install")
+        return d.print()
+    if not m:
+        d.add("FAIL", "installed", "no manifest in %s" % home, "run ./install.sh from the repo")
+        return d.print()
+    d.add("PASS", "installed", "version %s, manifest %s" % (m.get("version"), manifest_path(home)))
+    if m.get("incomplete"):
+        d.add("FAIL", "manifest", m["incomplete"], "re-run install")
+    doctor_config(d, home)
+    # app files
+    missing, modified = [], []
+    for rel, h in sorted(m["app"]["files"].items()):
+        cur = sha256_file(os.path.join(ctx.app_dir, rel))
+        if cur is None:
+            missing.append(rel)
+        elif cur != h and rel != PRICING_REL:
+            modified.append(rel)
+    if missing:
+        d.add("FAIL", "app files", "missing in %s: %s" % (ctx.app_dir, ", ".join(missing)),
+              "re-run ./install.sh")
+    elif modified:
+        d.add("WARN", "app files", "changed since install: %s" % ", ".join(modified), "re-run ./install.sh")
+    else:
+        d.add("PASS", "app files", "%d files present in %s" % (len(m["app"]["files"]), ctx.app_dir))
+    if m["app"].get("pricing_user_edited"):
+        d.add("PASS", "pricing", "using your edited pricing.json (new defaults in pricing.json.new)")
+    # scopes
+    claude_ok = shutil.which("claude")
+    totals = {e: 0 for e in HOOK_EVENTS}
+    by_file = []
+    for rec in all_scopes(m):
+        label = "global" if rec["scope"] == "global" else "project:" + os.path.basename(rec["project_dir"])
+        bad = []
+        for dest, r in sorted((rec.get("files") or {}).items()):
+            cur = sha256_file(dest)
+            if cur is None:
+                bad.append("missing " + dest)
+            elif cur != r.get("sha256"):
+                bad.append("modified " + dest)
+        if bad:
+            d.add("WARN" if all(b.startswith("modified") for b in bad) else "FAIL", label + " kit files",
+                  "; ".join(bad), "re-run install for this scope")
+        else:
+            names = []
+            for a in AGENT_FILES:
+                b = read_bytes(os.path.join(rec["claude_dir"], "agents", a)) or b""
+                mm = re.search(rb"^name:\s*(\S+)", b, re.M)
+                if mm:
+                    names.append(mm.group(1).decode())
+            d.add("PASS" if len(names) == 3 else "FAIL", label + " agents",
+                  "visible to Claude Code: %s (+ model-router skill)" % ", ".join(names),
+                  "re-run install")
+        cm = rec.get("claude_md") or {}
+        mdp = cm.get("path")
+        if mdp:
+            text = _dec(read_bytes(mdp) or b"")
+            line = DEFAULT_SNIPPET
+            n = sum(1 for l in text.split("\n") if l.rstrip("\r").strip() == line)
+            if n == 1:
+                d.add("PASS", label + " CLAUDE.md", "router line present once (%s)" % cm.get("state"))
+            elif n == 0:
+                d.add("FAIL", label + " CLAUDE.md", "router line missing in %s" % mdp, "re-run install")
+            else:
+                d.add("WARN", label + " CLAUDE.md", "router line appears %d times in %s" % (n, mdp),
+                      "remove the extra copies")
+        sp = (rec.get("settings") or {}).get("path") or os.path.join(rec["claude_dir"], "settings.json")
+        for p in (sp, os.path.join(os.path.dirname(sp), "settings.local.json")):
+            if not os.path.exists(p):
+                continue
+            counts, err = count_our_hooks(p)
+            if err:
+                d.add("FAIL", label + " settings", err, "fix the JSON syntax")
+                continue
+            if p == sp:
+                d.add("PASS", label + " settings", "%s is valid JSON" % p)
+            by_file.append((label, p, counts, rec.get("project_dir")))
+            for e in HOOK_EVENTS:
+                totals[e] += counts[e]
+        if (rec.get("settings") or {}).get("entries"):
+            counts, err = count_our_hooks(sp)
+            missing_ev = [e for e in HOOK_EVENTS if counts[e] == 0]
+            if missing_ev and not err:
+                d.add("FAIL", label + " hooks", "missing for %s in %s" % (", ".join(missing_ev), sp),
+                      "re-run install")
+    gpath = os.path.join(default_claude_dir(), "settings.json")
+    if not any(same_path(x[1], gpath) for x in by_file) and os.path.exists(gpath):
+        counts, err = count_our_hooks(gpath)
+        if not err:
+            by_file.append(("global(unrecorded)", gpath, counts, None))
+            for e in HOOK_EVENTS:
+                totals[e] += counts[e]
+    dups = [e for e in HOOK_EVENTS if totals[e] > 1]
+    if not any(totals.values()):
+        d.add("FAIL", "hooks", "no TokenTier hooks registered anywhere; nothing will be logged",
+              "re-run ./install.sh (without --no-hooks)")
+    elif dups:
+        where = ["%s (%s)" % (p, lab) for lab, p, c, _ in by_file if any(c[e] for e in dups)]
+        pdirs = []
+        for lab, p, c, pd in by_file:
+            if pd and any(c.values()) and pd not in pdirs:
+                pdirs.append(pd)
+        fix = " ; ".join("tokentier uninstall --project %s --hooks-only" % shell_quote(x) for x in pdirs) \
+            or "keep only one TokenTier hook per event (remove the extra entries from settings.json)"
+        d.add("WARN", "hooks", "registered more than once for %s, events will be logged twice: %s"
+              % (", ".join(dups), "; ".join(where)), fix)
+    else:
+        missing_ev = [e for e in HOOK_EVENTS if totals[e] == 0]
+        if missing_ev:
+            d.add("WARN", "hooks", "registered, but not for %s" % ", ".join(missing_ev), "re-run install")
+        else:
+            d.add("PASS", "hooks", "registered exactly once for all %d events" % len(HOOK_EVENTS))
+    doctor_hook_form(d, [p for _, p, c, _ in by_file if any(c.values())], win)
+    # logs
+    try:
+        os.makedirs(ctx.logs, exist_ok=True)
+        fd, tp = tempfile.mkstemp(dir=ctx.logs, prefix=".doctor-")
+        os.close(fd)
+        os.unlink(tp)
+        d.add("PASS", "log dir", "%s is writable" % ctx.logs)
+    except OSError as e:
+        d.add("FAIL", "log dir", "%s not writable: %s" % (ctx.logs, e), "fix permissions of %s" % ctx.logs)
+    hook = os.path.join(ctx.app_dir, "hooks", "tokentier_log.py")
+    if not os.path.isfile(hook):
+        hook = Source(ROOT).hook
+    py = hook_python() if win else "python3"
+    ok, msg = run_hook_selftest(hook, py)
+    d.add("PASS" if ok else "FAIL", "hook self-test", "synthetic SessionStart -> %s" % msg,
+          ("run `echo {} | %s SessionStart` and check %s" % (subprocess.list2cmdline([py, hook]),
+                                                              os.path.join(home, "hook-errors.log")))
+          if win else "run `python3 %s SessionStart < /dev/null` and check %s/hook-errors.log" % (hook, home))
+    # port / service
+    svc = m.get("service")
+    port = (svc or {}).get("port") or DEFAULT_PORT
+    st = port_state(port)
+    if st == "tokentier":
+        d.add("PASS", "dashboard port", "127.0.0.1:%d is served by TokenTier" % port)
+    elif st == "free":
+        d.add("WARN" if svc else "PASS", "dashboard port", "127.0.0.1:%d is free%s" % (
+            port, " but the service is not answering" if svc else ""),
+            "check %s/dashboard.log, or start it by hand: %s dashboard" % (home, tt) if svc else None)
+    else:
+        d.add("FAIL" if svc else "WARN", "dashboard port",
+              "127.0.0.1:%d is used by another program (not TokenTier)" % port,
+              "stop that program, or re-install with --port N")
+    if svc:
+        exists = os.path.isfile(svc.get("path", ""))
+        run = service_running(ctx, svc)
+        d.add("PASS" if exists and run is not False else "WARN", "service",
+              "%s %s, running: %s" % (service_label(svc), "file present" if exists else "FILE MISSING",
+                                      {True: "yes", False: "no", None: "unknown"}[run]),
+              "re-run install, or check %s/dashboard.log" % home)
+    else:
+        d.add("PASS", "service", "not installed (start with `%s dashboard`)" % tt)
+    d.add("PASS" if claude_ok else "WARN", "claude CLI",
+          claude_ok or "`claude` not found on PATH (fine if you use the desktop app)",
+          "install Claude Code")
+    return d.print()
+
+
+# ------------------------------------------------------------------- config
+def _load_config_for_write(home):
+    c = cfgmod()
+    path = c.config_path(home)
+    raw = read_bytes(path)
+    try:
+        data = parse_settings(raw, path)
+    except SettingsError as e:
+        raise Abort("%s Refusing to overwrite it; fix or delete it first." % str(e).replace(
+            " TokenTier changed nothing.", "").replace(" Fix the file (or move it aside) and run the "
+                                                         "command again.", ""))
+    return path, raw, data
+
+
+def _config_fail(e):
+    sys.stderr.write("ERROR: %s\n" % e)
+    return 2
+
+
+def _fmt_cfg_value(v):
+    return json.dumps(v)
+
+
+def cmd_config(args):
+    c = cfgmod()
+    home = resolve_home(args.home)
+    action = args.action
+    if action == "path":
+        say(c.config_path(home))
+        return 0
+    if action == "list":
+        data, _err = c.read_config(home)
+        vals, warns = c.resolve(home)
+        if args.json:
+            say(json.dumps({"path": c.config_path(home), "file": data,
+                            "effective": {k: {"value": v, "source": src} for k, (v, src) in vals.items()}},
+                           indent=2))
+            return 0
+        say("config file: %s%s" % (c.config_path(home), "" if os.path.exists(c.config_path(home))
+                                    else " (not created yet)"))
+        for k in c.KEY_ORDER:
+            v, src = vals[k]
+            say("  %-27s %-12s (%s)" % (k, _fmt_cfg_value(v), src))
+        for k in data:
+            if k not in c.KEYS:
+                say("  %-27s %-12s (unknown key, ignored)" % (k, _fmt_cfg_value(data[k])))
+        for w in warns:
+            warn(w)
+        return 0
+    if action == "get":
+        key = args.key
+        if key == "host" or key not in c.KEYS:
+            return _config_fail("unknown key %r (valid keys: %s)" % (key, ", ".join(c.KEY_ORDER)))
+        vals, _ = c.resolve(home)
+        v, src = vals[key]
+        say(_fmt_cfg_value(v) if not isinstance(v, str) else v)
+        if src != "config.json":
+            sys.stderr.write("(%s)\n" % ("built-in default" if src == "default" else "from " + src))
+        return 0
+    if action == "set":
+        try:
+            val = c.parse_cli_value(args.key, args.value)
+        except c.ConfigError as e:
+            return _config_fail(e)
+        path, raw, data = _load_config_for_write(home)
+        if val is None:  # explicit null: same as unset, but keep the key visible as null
+            data[args.key] = None
+        else:
+            data[args.key] = val
+        atomic_write(path, dump_settings(data, json_style(raw)), 0o644 if raw is None else None)
+        say("%s = %s  (%s)" % (args.key, _fmt_cfg_value(val), path))
+        if args.key == "port":
+            m = load_manifest(home)
+            if (m or {}).get("service"):
+                say("note: the always-on service has its port baked into the service file; run "
+                    "`tokentier install` to apply the new port.")
+        elif args.key == "retention_days" and val:
+            say("note: the dashboard prunes at startup and every 24h; or run `tokentier prune` now.")
+        return 0
+    if action == "unset":
+        key = args.key
+        path, raw, data = _load_config_for_write(home)
+        if key not in data:
+            if key != "host" and key not in c.KEYS:
+                return _config_fail("unknown key %r (valid keys: %s)" % (key, ", ".join(c.KEY_ORDER)))
+            say("%s is not set in %s (nothing to do)" % (key, path))
+            return 0
+        del data[key]
+        atomic_write(path, dump_settings(data, json_style(raw)))
+        say("removed %s from %s" % (key, path))
+        return 0
+    return 2
+
+
+# -------------------------------------------------------------------- prune
+def cmd_prune(args):
+    c = cfgmod()
+    home = resolve_home(args.home)
+    logs = os.path.join(home, "logs")
+    if args.older_than is not None:
+        days, src = args.older_than, "--older-than"
+        if days < 1:
+            return _config_fail("--older-than must be an integer >= 1")
+    else:
+        vals, warns = c.resolve(home)
+        for w in warns:
+            warn(w)
+        days, src = vals["retention_days"]
+        if not days:
+            say("retention not configured; nothing to do")
+            return 0
+        src = "TOKENTIER_RETENTION_DAYS" if src == "env" else "config.json retention_days"
+    today = _dt.date.today()
+    items = c.find_expired(logs, days, today)
+    say("Log retention: delete daily logs dated before %s (older than %d days, from %s; today's and "
+        "yesterday's logs are never deleted)" % (today - _dt.timedelta(days=days), days, src))
+    if not items:
+        say("Nothing to prune in %s." % logs)
+        return 0
+    total = sum(i[2] for i in items)
+    say("%s %d file(s), %s:" % ("Would delete" if args.dry_run else "Will delete", len(items),
+                                 c.fmt_size(total)))
+    for p, d, size in items:
+        say("  %s  %s" % (p, c.fmt_size(size)))
+    if args.dry_run:
+        say("Dry run: nothing was deleted.")
+        return 0
+    if not confirm(args, "Delete these %d file(s)? This cannot be undone." % len(items)):
+        say("Cancelled. Nothing was deleted.")
+        return 1
+    done = c.delete_files(items)
+    say("Deleted %d file(s), %s." % (len(done), c.fmt_size(sum(i[2] for i in done))))
+    if len(done) != len(items):
+        warn("%d file(s) could not be deleted" % (len(items) - len(done)))
+        return 1
+    return 0
+
+
+# ------------------------------------------------------------ dashboard/open
+def cmd_dashboard(args):
+    home = resolve_home(args.home)
+    m = load_manifest(home)
+    port = effective_port(home, args.port, m)
+    server = os.path.join(home, "app", "dashboard", "server.py")
+    if not os.path.isfile(server):
+        server = os.path.join(ROOT, "dashboard", "server.py")
+    st = port_state(port)
+    if st == "tokentier":
+        say("A TokenTier dashboard is already running at http://127.0.0.1:%d/" % port)
+        return 0
+    if st == "other":
+        raise Abort("port %d is used by another program. Use --port N." % port)
+    env = dict(os.environ, TOKENTIER_HOME=home)
+    py = sys.executable
+    argv = [py, server, "--host", "127.0.0.1", "--port", str(port)]
+    if os.name == "nt":
+        # no real exec() on Windows: os.execve would detach from the console and break Ctrl+C
+        try:
+            return subprocess.call(argv, env=env)
+        except KeyboardInterrupt:
+            return 0
+    os.execve(py, argv, env)
+
+
+def cmd_open(args):
+    import webbrowser
+    home = resolve_home(args.home)
+    m = load_manifest(home)
+    port = effective_port(home, args.port, m)
+    url = "http://127.0.0.1:%d/" % port
+    if not http_health(port):
+        warn("nothing answers at %s yet; start it with `tokentier dashboard`" % url)
+    say(url)
+    webbrowser.open(url)
+    return 0
+
+
+def cmd_version(args):
+    say("tokentier %s" % read_version())
+    return 0
+
+
+# -------------------------------------------------------------------- stats
+STATS_TIERS = ("haiku", "sonnet", "opus")
+TIER_AGENT = {"haiku": "fast-worker", "sonnet": "mid-worker", "opus": "deep-worker"}
+STATS_MIN_SAMPLES = 5
+STATS_PASS_TARGET = 0.8
+_TAG_RE = re.compile(r"^\s*\[([A-Za-z0-9_-]+)\]")
+
+
+def task_type(label):
+    """Leading `[type]` tag of a task label (lowercased), else 'untagged'."""
+    m = _TAG_RE.match(label) if isinstance(label, str) else None
+    return m.group(1).lower() if m else "untagged"
+
+
+def _load_pricing():
+    """The dashboard's Pricing class and the pricing.json next to it (None if unavailable)."""
+    dash = os.path.join(ROOT, "dashboard")
+    try:
+        if dash not in sys.path:
+            sys.path.insert(0, dash)
+        from tokentier_dash.pricing import Pricing
+        return Pricing(os.path.join(dash, "pricing.json"))
+    except Exception:
+        return None
+
+
+def _stats_events(logs, since):
+    """task_end events (last one per task_id) at or after `since` (aware datetime), oldest first."""
+    ends = {}
+    for _, line in iter_log_lines(logs):
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(ev, dict) or ev.get("event") != "task_end":
+            continue
+        d = _parse_ts(ev.get("ts"))
+        tid = ev.get("task_id")
+        if d is None or not isinstance(tid, str) or d < since:
+            continue
+        ends[tid] = (d, ev)
+    return [ends[k] for k in sorted(ends, key=lambda k: ends[k][0])]
+
+
+def _chains(items):
+    """Group (datetime, event) pairs into chains of attempts.
+
+    Router-worker tasks of one session with the same label form a chain while the previous
+    attempt ended `escalated`; every other task is a chain of one."""
+    chains, open_chain = [], {}
+    for _, ev in items:
+        if ev.get("tier") not in STATS_TIERS:
+            continue
+        if ev.get("router_worker"):
+            key = (ev.get("session_id"), ev.get("label"))
+            cur = open_chain.get(key)
+            if cur is None:
+                cur = []
+                chains.append(cur)
+            cur.append(ev)
+            if ev.get("status") == "escalated":
+                open_chain[key] = cur
+            else:
+                open_chain.pop(key, None)
+        else:
+            chains.append([ev])
+    return chains
+
+
+def recommend(tiers):
+    """tiers: {tier: {"n": attempts, "pass": passes}}. Returns the recommended tier or None.
+
+    Cheapest tier with >= 5 attempts and pass rate >= 80%; otherwise the tier above the highest
+    evaluated (>= 5 attempts) tier that fell short; None when no tier has enough data."""
+    failed_idx = None
+    for i, t in enumerate(STATS_TIERS):
+        s = tiers.get(t) or {}
+        n = s.get("n", 0)
+        if n >= STATS_MIN_SAMPLES:
+            if s.get("pass", 0) >= STATS_PASS_TARGET * n - 1e-9:
+                return t
+            failed_idx = i
+    if failed_idx is None:
+        return None
+    return STATS_TIERS[min(failed_idx + 1, len(STATS_TIERS) - 1)]
+
+
+def compute_stats(logs, now, days=30, pricing=None):
+    """{type: stats-dict} for task_end events in the last `days` days."""
+    since = now - _dt.timedelta(days=days)
+    types = {}
+    for chain in _chains(_stats_events(logs, since)):
+        ty = task_type(chain[0].get("label"))
+        t = types.setdefault(ty, {"tiers": {k: {"n": 0, "pass": 0} for k in STATS_TIERS},
+                                  "chains": 0, "escalated_chains": 0, "cost": 0.0, "cost_chains": 0})
+        t["chains"] += 1
+        cost, known = 0.0, False
+        for ev in chain:
+            st = ev.get("status")
+            ts = t["tiers"][ev["tier"]]
+            if st in ("pass", "fixed", "fail", "escalated"):
+                ts["n"] += 1
+                if st in ("pass", "fixed"):
+                    ts["pass"] += 1
+            if pricing is not None and ev.get("source") != "legacy" and isinstance(ev.get("tokens"), dict):
+                key = pricing.resolve(ev.get("model"), ev.get("tier"))
+                c = pricing.cost(ev["tokens"], key) if key else None
+                if c:
+                    cost += c["total"]
+                    known = True
+        if any(e.get("status") == "escalated" for e in chain):
+            t["escalated_chains"] += 1
+        if known:
+            t["cost"] += cost
+            t["cost_chains"] += 1
+    out = {}
+    for ty, t in types.items():
+        attempts = sum(s["n"] for s in t["tiers"].values())
+        rec = recommend(t["tiers"]) if attempts >= STATS_MIN_SAMPLES else None
+        rs = t["tiers"][rec] if rec else None
+        out[ty] = {
+            "tasks": t["chains"],
+            "attempts": attempts,
+            "tiers": {k: {"tasks": s["n"], "pass_rate": (s["pass"] / float(s["n"]) if s["n"] else None)}
+                      for k, s in t["tiers"].items()},
+            "escalation_rate": t["escalated_chains"] / float(t["chains"]),
+            "avg_cost": (t["cost"] / t["cost_chains"]) if t["cost_chains"] else None,
+            "recommended_tier": rec,
+            "recommended_samples": rs["n"] if rs else 0,
+            "recommended_pass_rate": (rs["pass"] / float(rs["n"]) if rs and rs["n"] else None),
+        }
+    return out
+
+
+def hints_payload(stats, now):
+    types = {}
+    for ty, s in sorted(stats.items()):
+        if ty == "untagged" or not s["recommended_tier"]:
+            continue
+        pr = s["recommended_pass_rate"]
+        types[ty] = {"start": TIER_AGENT[s["recommended_tier"]], "samples": s["recommended_samples"],
+                     "pass_rate": round(pr, 2) if pr is not None else None}
+    return {"generated": now.astimezone().replace(microsecond=0).isoformat(), "types": types}
+
+
+def _pct(x):
+    return "-" if x is None else "%d%%" % int(round(x * 100))
+
+
+def format_stats(stats, days):
+    if not stats:
+        return ("No finished tasks in the last %d days. Run some routed tasks in Claude Code first "
+                "(logs live in <home>/logs)." % days)
+    lines = ["Routing stats, last %d days" % days, ""]
+    hdr = ["type", "tasks", "haiku", "sonnet", "opus", "esc", "avg $", "start tier"]
+    rows = []
+    for ty in sorted(stats, key=lambda k: (-stats[k]["tasks"], k)):
+        s = stats[ty]
+        cells = []
+        for k in STATS_TIERS:
+            t = s["tiers"][k]
+            cells.append("%d (%s)" % (t["tasks"], _pct(t["pass_rate"])) if t["tasks"] else "-")
+        rec = s["recommended_tier"]
+        rows.append([ty, str(s["tasks"])] + cells + [
+            _pct(s["escalation_rate"]),
+            "-" if s["avg_cost"] is None else "$%.4f" % s["avg_cost"],
+            TIER_AGENT[rec] if rec else "insufficient data"])
+    widths = [max(len(r[i]) for r in [hdr] + rows) for i in range(len(hdr))]
+    for r in [hdr] + rows:
+        lines.append("  ".join(c.ljust(widths[i]) if i in (0, 7) else c.rjust(widths[i])
+                               for i, c in enumerate(r)).rstrip())
+        if r is hdr:
+            lines.append("  ".join("-" * w for w in widths))
+    lines += ["", "Tier columns: attempts (pass rate). esc = share of tasks that escalated. A start tier "
+              "needs >= %d attempts at >= %d%% pass rate." % (STATS_MIN_SAMPLES, int(STATS_PASS_TARGET * 100))]
+    return "\n".join(lines)
+
+
+def cmd_stats(args):
+    home = resolve_home(args.home)
+    if args.days < 1:
+        raise Abort("--days must be at least 1")
+    now = _dt.datetime.now(_dt.timezone.utc)
+    stats = compute_stats(os.path.join(home, "logs"), now, args.days, _load_pricing())
+    payload = hints_payload(stats, now)
+    if args.json:
+        say(json.dumps({"days": args.days, "types": stats, "hints": payload["types"]}, indent=2, sort_keys=True))
+    else:
+        say(format_stats(stats, args.days))
+    if args.write_hints:
+        path = os.path.join(home, "routing-hints.json")
+        atomic_write(path, (json.dumps(payload, indent=2) + "\n").encode("utf-8"), 0o644)
+        sys.stderr.write("wrote %s (%d task types)\n" % (path, len(payload["types"])))
+    return 0
+
+
+# ------------------------------------------------------------------ migrate
+LEGACY_TIER = {"haiku": ("haiku", "fast-worker", True), "mid": ("sonnet", "mid-worker", True),
+               "sonnet": ("sonnet", "mid-worker", True), "opus": ("opus", "deep-worker", True),
+               "deep": ("opus", "deep-worker", True), "lead": ("sonnet", "lead", False)}
+LEGACY_STATUS = {"pass": "pass", "done": "pass", "fixed": "fixed", "fail": "fail", "failed": "fail",
+                 "skip": "skip", "escalate": "escalated", "escalated": "escalated", "running": "running"}
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _local_iso(epoch):
+    if hasattr(time, "tzset"):
+        time.tzset()
+    d = _dt.datetime.fromtimestamp(epoch).astimezone()
+    off = d.strftime("%z")
+    return d.strftime("%Y-%m-%dT%H:%M:%S.") + "%03d" % (d.microsecond // 1000) + off[:3] + ":" + off[3:]
+
+
+def _mk(date, h=0, mi=0, s=0, dd=0):
+    y, mo, da = (int(x) for x in date.split("-"))
+    return time.mktime((y, mo, da + dd, h, mi, s, 0, 0, -1))
+
+
+def parse_redates(items):
+    out = {}
+    for it in items or []:
+        m = re.match(r"^(\d{4}-\d{2}-\d{2}):([^=]+)=(\d{4}-\d{2}-\d{2})$", it.strip())
+        if not m:
+            raise Abort("bad --redate %r; use SESSIONDATE:TASKID=YYYY-MM-DD, e.g. 2026-10-03:t75=2026-10-04 "
+                        "(TASKID may be a list t1,t2 or a range t70-t79)" % it)
+        sd, ids, nd = m.groups()
+        for d in (sd, nd):
+            try:
+                _dt.datetime.strptime(d, "%Y-%m-%d")
+            except ValueError:
+                raise Abort("bad date %r in --redate %r" % (d, it))
+        for part in ids.split(","):
+            part = part.strip()
+            r = re.match(r"^([A-Za-z_]*)(\d+)-([A-Za-z_]*)(\d+)$", part)
+            if r and r.group(1) == r.group(3):
+                a, b = int(r.group(2)), int(r.group(4))
+                for n in range(min(a, b), max(a, b) + 1):
+                    out[(sd, "%s%d" % (r.group(1), n))] = nd
+            elif part:
+                out[(sd, part)] = nd
+    return out
+
+
+def build_legacy_events(data, redates, project_override=None):
+    """Pure conversion. Returns (events, info)."""
+    if not isinstance(data, dict) or not isinstance(data.get("sessions"), list):
+        raise Abort("not a legacy router-kit file: expected an object with a 'sessions' list")
+    praw = project_override or str(data.get("project") or "unknown")
+    project = os.path.basename(praw.rstrip("/")) or "unknown"
+    project_path = praw if os.path.isabs(praw) else None
+    info = {"project": project, "sessions": [], "redated": [], "start_only": [], "unknown_tiers": set(),
+            "layout": []}
+    rd = dict(redates)
+    rows = []  # (target_date, orig_date, task)
+    seen_ids = set()
+    for s in data["sessions"]:
+        if not isinstance(s, dict):
+            continue
+        date = str(s.get("date") or s.get("id") or "")
+        if not _DATE_RE.match(date):
+            raise Abort("legacy session %r has no YYYY-MM-DD date" % s.get("id"))
+        tasks = [t for t in (s.get("tasks") or []) if isinstance(t, dict)]
+        info["sessions"].append((date, len(tasks)))
+        for t in tasks:
+            tid = str(t.get("id"))
+            target = rd.pop((date, tid), date)
+            if target != date:
+                info["redated"].append("%s:%s -> %s" % (date, tid, target))
+            ntid = "legacy-%s-%s" % (date, tid)
+            k = 2
+            while ntid in seen_ids:
+                ntid = "legacy-%s-%s-%d" % (date, tid, k)
+                k += 1
+            seen_ids.add(ntid)
+            rows.append((target, date, tid, ntid, t))
+    if rd:
+        raise Abort("--redate refers to unknown task(s): %s" % ", ".join("%s:%s" % k for k in sorted(rd)))
+    groups = {}
+    for r in rows:
+        groups.setdefault(r[0], []).append(r)
+    events = []
+    gap = 1.0
+    for target in sorted(groups):
+        g = groups[target]
+        durs = [max(0, int(r[4].get("duration_ms") or 0)) / 1000.0 for r in g]
+        span = gap * (len(g) + 1) + sum(durs)
+        day0, day1 = _mk(target), _mk(target, dd=1) - 1
+        base = _mk(target, 12)
+        if base + span > day1:
+            base = max(day0, day1 - span)
+        scale = 1.0
+        if base + span > day1:
+            scale = (day1 - base) / span
+        if base != _mk(target, 12) or scale != 1.0:
+            info["layout"].append("%s: %d tasks need %.1fh; timeline starts at %s%s to stay on that day"
+                                  % (target, len(g), span / 3600.0, _local_iso(base)[11:16],
+                                     " (compressed x%.2f)" % scale if scale != 1.0 else ""))
+        sid = "legacy-%s" % target
+
+        def base_ev(kind, epoch):
+            return {"v": 1, "ts": _local_iso(epoch), "event": kind, "session_id": sid, "project": project,
+                    "project_path": project_path, "user_id": None, "workspace_id": None, "source": "legacy"}
+
+        sev = base_ev("session_start", base)
+        events.append(sev)
+        off = gap
+        for (tdate, odate, tid, ntid, t), dur in zip(g, durs):
+            st = base + off * scale
+            en = st + dur * scale
+            off += dur + gap
+            raw_tier = str(t.get("tier") or "").lower()
+            tier, agent, router = LEGACY_TIER.get(raw_tier, (raw_tier or "unknown", None, False))
+            if raw_tier not in LEGACY_TIER:
+                info["unknown_tiers"].add(raw_tier)
+            common = {"task_id": ntid, "agent_type": agent, "tier": tier, "legacy_tier": raw_tier,
+                      "router_worker": router, "label": t.get("label"), "detail": t.get("detail"),
+                      "app": t.get("app"), "tool_use_id": None, "legacy_id": tid, "legacy_session": odate}
+            ev = base_ev("task_start", st)
+            ev.update(common)
+            ev["status"] = "running"
+            events.append(ev)
+            status = LEGACY_STATUS.get(str(t.get("status") or "").lower(), str(t.get("status") or "unknown"))
+            if status == "running":
+                info["start_only"].append("%s:%s" % (odate, tid))
+                continue
+            total = int(t.get("tokens") or 0)
+            ee = base_ev("task_end", en)
+            ee.update(common)
+            ee.update({"model": None, "started_at": _local_iso(st),
+                       "duration_ms": int(t.get("duration_ms") or 0),
+                       "tokens": {"input": 0, "output": 0, "cache_creation": 0, "cache_read": 0},
+                       "tokens_total": total, "legacy_tokens_total": total,
+                       "opus_est_tokens": t.get("opus_est_tokens"), "status": status,
+                       "result": t.get("result")})
+            events.append(ee)
+    return events, info
+
+
+def _event_key(ev):
+    if ev.get("event") in ("task_start", "task_end", "escalation"):
+        return (ev.get("event"), ev.get("task_id"))
+    return (ev.get("event"), ev.get("session_id"))
+
+
+def _append_lines(path, lines):
+    """Append JSONL in binary (always LF, never CRLF), under the same lock the hook uses."""
+    data = "".join(json.dumps(e, ensure_ascii=False, separators=(",", ":")) + "\n" for e in lines).encode()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # O_BINARY: without it the Windows CRT turns every \n into \r\n
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o644)
+    lock_fd = None
+    try:
+        try:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except ImportError:  # Windows: lock byte 0 of logs/.tokentier-append.lock (as the hook does)
+            try:
+                import msvcrt
+                lock_fd = os.open(os.path.join(os.path.dirname(path), ".tokentier-append.lock"),
+                                  os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o644)
+                deadline = time.time() + 1.0
+                while True:
+                    try:
+                        msvcrt.locking(lock_fd, msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        if time.time() >= deadline:
+                            break  # append anyway
+                        time.sleep(0.02)
+            except (ImportError, OSError):
+                pass
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+        if lock_fd is not None:
+            try:
+                import msvcrt
+                os.lseek(lock_fd, 0, 0)
+                msvcrt.locking(lock_fd, msvcrt.LK_UNLCK, 1)
+            except (ImportError, OSError):
+                pass  # not locked (timed out); closing the handle drops any lock anyway
+            os.close(lock_fd)
+
+
+def cmd_migrate(args):
+    if args.what != "legacy":
+        raise Abort("unknown migration %r (supported: legacy)" % args.what)
+    home = resolve_home(args.home)
+    logs = os.path.join(home, "logs")
+    try:
+        with open(args.file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        raise Abort("cannot read %s: %s" % (args.file, e))
+    events, info = build_legacy_events(data, parse_redates(args.redate), args.project)
+    existing = {}
+    removals = {}
+    for p, line in iter_log_lines(logs):
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        if args.replace and ev.get("source") == "legacy" and ev.get("project") == info["project"]:
+            removals[p] = removals.get(p, 0) + 1
+            continue
+        existing.setdefault(_event_key(ev), []).append(ev)
+    new = [e for e in events if _event_key(e) not in existing]
+    skipped = len(events) - len(new)
+    # warn when a re-date would be silently ignored because the task is already imported
+    stale = []
+    for e in events:
+        if e["event"] == "task_start" and _event_key(e) in existing:
+            old = existing[_event_key(e)][0]
+            if (old.get("session_id") != e["session_id"]):
+                stale.append(e["task_id"])
+    by_file = {}
+    for e in new:
+        day = e["ts"][:10]
+        by_file.setdefault(os.path.join(logs, day + ".jsonl"), []).append(e)
+    say("Legacy import: %s (project %s)%s" % (args.file, info["project"], "  [dry run]" if args.dry_run else ""))
+    say("  sessions : %s" % ", ".join("%s (%d tasks)" % s for s in info["sessions"]))
+    if info["redated"]:
+        say("  redated  : %s" % ", ".join(info["redated"]))
+    for l in info["layout"]:
+        say("  layout   : %s" % l)
+    if info["start_only"]:
+        say("  running  : %s had status 'running'; imported without a task_end (dashboard shows them "
+            "as stale)" % ", ".join(info["start_only"]))
+    if info["unknown_tiers"]:
+        warn("unknown legacy tier(s) %s kept as-is (no pricing)" % ", ".join(sorted(info["unknown_tiers"])))
+    if removals:
+        say("  replace  : removing %d earlier legacy event(s) for project %s from %d file(s)"
+            % (sum(removals.values()), info["project"], len(removals)))
+    say("  events   : %d new, %d already present (skipped)" % (len(new), skipped))
+    for p in sorted(by_file):
+        say("  write    : %s (+%d)" % (p, len(by_file[p])))
+    if stale:
+        raise Abort("%d task(s) are already imported under another date, so --redate cannot move them "
+                    "without rewriting the log: %s. Nothing was written. Re-run with --replace (it removes "
+                    "only this project's earlier legacy events, then imports again)."
+                    % (len(stale), ", ".join(stale[:5]) + (" ..." if len(stale) > 5 else "")))
+    if args.dry_run:
+        say("Dry run: nothing was written.")
+        return 0
+    for p, n in removals.items():
+        keep = []
+        with open(p, "r", encoding="utf-8", errors="surrogateescape") as f:
+            for line in f:
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    keep.append(line)
+                    continue
+                if isinstance(ev, dict) and ev.get("source") == "legacy" and ev.get("project") == info["project"]:
+                    continue
+                keep.append(line)
+        if any(l.strip() for l in keep):
+            atomic_write(p, "".join(keep).encode("utf-8", "surrogateescape"))
+        else:
+            os.unlink(p)
+    for p in sorted(by_file):
+        _append_lines(p, by_file[p])
+    say("Done. %d event(s) written to %s" % (len(new), logs))
+    return 0
+
+
+# --------------------------------------------------------------------- main
+def build_parser():
+    ap = argparse.ArgumentParser(prog="tokentier", description="TokenTier: cost-aware model routing for "
+                                 "Claude Code (local logs + dashboard).")
+    sub = ap.add_subparsers(dest="cmd")
+
+    def common(p):
+        p.add_argument("--home", help="TokenTier home (default $TOKENTIER_HOME or ~/.tokentier)")
+
+    p = sub.add_parser("install", help="install or upgrade TokenTier")
+    common(p)
+    p.add_argument("--project", nargs="?", const=os.getcwd(), default=None, metavar="DIR",
+                   help="install into a project (DIR/.claude, DIR/CLAUDE.md); default DIR is the cwd")
+    p.add_argument("--claude-dir", help="Claude Code config dir (default ~/.claude, or DIR/.claude)")
+    p.add_argument("--port", type=int, help="dashboard port (default 8899)")
+    p.add_argument("--dry-run", action="store_true", help="show what would change, write nothing")
+    p.add_argument("--yes", "-y", action="store_true", help="do not ask for confirmation")
+    p.add_argument("--no-service", action="store_true", help="do not install the always-on dashboard")
+    p.add_argument("--no-hooks", action="store_true", help="do not register logging hooks")
+
+    p = sub.add_parser("uninstall", help="remove what TokenTier installed (from the manifest)")
+    common(p)
+    p.add_argument("--project", metavar="DIR", nargs="?", const=os.getcwd(), default=None,
+                   help="only remove the install recorded for this project")
+    p.add_argument("--hooks-only", action="store_true", help="only remove the hook entries")
+    p.add_argument("--purge", action="store_true",
+                   help="delete the whole TokenTier folder (~/.tokentier), including your logs")
+    p.add_argument("--keep-service", action="store_true", help="keep the dashboard service and app")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--yes", "-y", action="store_true")
+
+    for name, h in (("status", "show install and dashboard status"),
+                    ("doctor", "check the installation (exit 1 on failures)")):
+        p = sub.add_parser(name, help=h)
+        common(p)
+        if name == "status":
+            p.add_argument("--port", type=int)
+    p = sub.add_parser("dashboard", help="run the dashboard server in the foreground")
+    common(p)
+    p.add_argument("--port", type=int)
+    p = sub.add_parser("open", help="open the dashboard in the browser")
+    common(p)
+    p.add_argument("--port", type=int)
+    p = sub.add_parser("migrate", help="import old data")
+    common(p)
+    p.add_argument("what", choices=["legacy"])
+    p.add_argument("--file", required=True, help="legacy router-kit-data.json")
+    p.add_argument("--redate", action="append", default=[], metavar="SESSIONDATE:TASKID=YYYY-MM-DD")
+    p.add_argument("--replace", action="store_true",
+                   help="first remove previously imported legacy events of this project")
+    p.add_argument("--project", help="project name override")
+    p.add_argument("--dry-run", action="store_true")
+    p = sub.add_parser("stats", help="per task-type routing stats and recommended start tiers")
+    common(p)
+    p.add_argument("--days", type=int, default=30, help="look back this many days (default 30)")
+    p.add_argument("--json", action="store_true", help="print JSON instead of a table")
+    p.add_argument("--write-hints", action="store_true",
+                   help="write <home>/routing-hints.json for the model-router skill")
+    p = sub.add_parser("config", help="show or change $TOKENTIER_HOME/config.json",
+                       description="Read and edit config.json. Keys: %s. Precedence: CLI flag > "
+                       "environment variable > config.json > built-in default. Exit codes: 0 ok, "
+                       "1 error (e.g. unreadable or invalid config.json), 2 invalid key or value."
+                       % ", ".join(cfgmod().KEY_ORDER))
+    csub = p.add_subparsers(dest="action", metavar="{list,get,set,unset,path}")
+    cp = csub.add_parser("list", help="show every key with its effective value and where it comes from")
+    common(cp)
+    cp.add_argument("--json", action="store_true", help="print JSON")
+    cp = csub.add_parser("get", help="print the effective value of KEY")
+    common(cp)
+    cp.add_argument("key", metavar="KEY")
+    cp = csub.add_parser("set", help="validate and store KEY = VALUE (use null to clear)")
+    common(cp)
+    cp.add_argument("key", metavar="KEY", help="one of: %s" % ", ".join(cfgmod().KEY_ORDER))
+    cp.add_argument("value", metavar="VALUE", help="port 1-65535; retention_days integer >= 1 or null; "
+                    "baseline_token_multiplier number > 0 or null; pricing_path existing pricing.json or null")
+    cp = csub.add_parser("unset", help="remove KEY from config.json")
+    common(cp)
+    cp.add_argument("key", metavar="KEY")
+    cp = csub.add_parser("path", help="print the path of config.json")
+    common(cp)
+    p = sub.add_parser("prune", help="delete daily logs older than the retention period",
+                       description="Delete logs/YYYY-MM-DD.jsonl files whose filename date is older than "
+                       "DAYS (default: retention_days from config.json). Today's and yesterday's files "
+                       "and files with other names are never touched.")
+    common(p)
+    p.add_argument("--older-than", type=int, metavar="DAYS", help="override retention_days")
+    p.add_argument("--dry-run", action="store_true", help="list what would be deleted, delete nothing")
+    p.add_argument("--yes", "-y", action="store_true", help="do not ask for confirmation")
+    sub.add_parser("version", help="print the version")
+    return ap
+
+
+def _safe_console():
+    """Never crash on a non-UTF-8 console (Windows cp1252/cp437): unencodable characters in paths
+    or diffs are printed as '?' instead of raising UnicodeEncodeError."""
+    for s in (sys.stdout, sys.stderr):
+        enc = (getattr(s, "encoding", None) or "").lower().replace("-", "").replace("_", "")
+        if s is not None and enc not in ("utf8", "utf8sig") and hasattr(s, "reconfigure"):
+            try:
+                s.reconfigure(errors="replace")
+            except Exception:
+                pass
+
+
+def main(argv=None):
+    _safe_console()
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    fn = {"install": cmd_install, "uninstall": cmd_uninstall, "status": cmd_status, "doctor": cmd_doctor,
+          "dashboard": cmd_dashboard, "open": cmd_open, "migrate": cmd_migrate, "stats": cmd_stats,
+          "config": cmd_config, "prune": cmd_prune, "version": cmd_version}.get(args.cmd)
+    if fn is None:
+        ap.print_help()
+        return 2
+    if args.cmd == "config" and not args.action:
+        build_parser().parse_args(["config", "--help"])
+    try:
+        return fn(args) or 0
+    except Abort as e:
+        sys.stderr.write("ERROR: %s\n" % e)
+        return 1
+    except KeyboardInterrupt:
+        sys.stderr.write("Interrupted.\n")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

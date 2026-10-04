@@ -1,0 +1,69 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests
+
+      - name: Verify tag matches VERSION
+        run: |
+          set -eu
+          tag_version="${GITHUB_REF_NAME#v}"
+          file_version="$(tr -d '[:space:]' < VERSION)"
+          if [ "$tag_version" != "$file_version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME expects VERSION to be '$tag_version' but VERSION contains '$file_version'. Update VERSION and re-tag."
+            exit 1
+          fi
+          echo "VERSION=$file_version" >> "$GITHUB_ENV"
+
+      - name: Build archives and checksums
+        run: |
+          set -eu
+          mkdir -p dist
+          git archive --format=tar.gz --prefix="tokentier-${VERSION}/" -o "dist/tokentier-${VERSION}.tar.gz" HEAD
+          git archive --format=zip --prefix="tokentier-${VERSION}/" -o "dist/tokentier-${VERSION}.zip" HEAD
+          cd dist
+          sha256sum "tokentier-${VERSION}.tar.gz" "tokentier-${VERSION}.zip" > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Extract release notes from CHANGELOG
+        run: |
+          set -eu
+          awk -v v="$VERSION" '
+            /^## \[/ {
+              if (found) exit
+              if (index($0, "## [" v "]") == 1) { found = 1; next }
+            }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          if ! grep -q '[^[:space:]]' release-notes.md; then
+            echo "Release ${VERSION}. See CHANGELOG.md for details." > release-notes.md
+          fi
+          cat release-notes.md
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: TokenTier ${{ github.ref_name }}
+          body_path: release-notes.md
+          files: |
+            dist/tokentier-${{ env.VERSION }}.tar.gz
+            dist/tokentier-${{ env.VERSION }}.zip
+            dist/SHA256SUMS
