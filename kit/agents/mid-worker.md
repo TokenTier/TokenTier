@@ -1,6 +1,6 @@
 ---
 name: mid-worker
-description: Mid-tier worker (Sonnet). Use for moderate tasks: multi-file edits, bug fixes, feature work, refactors with clear scope. Called second by the model-router skill, or first for medium-difficulty tasks.
+description: Mid-tier worker (Sonnet). Use for moderate tasks: multi-file edits, bug fixes, feature work, refactors with clear scope. Called second by the tokentier-router skill, or first for medium-difficulty tasks.
 model: sonnet
 effort: medium
 ---

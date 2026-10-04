@@ -29,7 +29,7 @@ Light theme (switch with the sun/moon button in the header; the choice is rememb
 | Piece | Where (global install) | Purpose |
 |---|---|---|
 | 3 worker agents | `~/.claude/agents/{fast,mid,deep}-worker.md` | Haiku / Sonnet / Opus subagents |
-| `model-router` skill | `~/.claude/skills/model-router/SKILL.md` | The cascade rules: start cheap, verify, escalate |
+| `tokentier-router` skill | `~/.claude/skills/tokentier-router/SKILL.md` | The cascade rules: start cheap, verify, escalate |
 | Router line | `~/.claude/CLAUDE.md`, between `<!-- tokentier:start -->` and `<!-- tokentier:end -->` | Tells Claude to use the skill |
 | Logging hooks | `~/.claude/settings.json` → `hooks.SessionStart/SessionEnd/SubagentStart/SubagentStop/Stop` | Append events to `~/.tokentier/logs/YYYY-MM-DD.jsonl`. The `Stop` hook also logs the main session's own token usage (counts only) |
 | App copy | `~/.tokentier/app/` | Hook script, dashboard, CLI. After install you can move or delete the repo |
@@ -172,7 +172,7 @@ Details, including fixing dates, are in [docs/migrating-from-router-kit.md](docs
 
 ## How routing works
 
-You (the main Claude Code session) are the router. For a non-trivial task the `model-router` skill does this:
+You (the main Claude Code session) are the router. For a non-trivial task the `tokentier-router` skill does this:
 
 1. **Classify and pick a start tier.** Simple edits, lookups and summaries start at `fast-worker` (Haiku). Multi-file changes, bug fixes with a known cause and tests start at `mid-worker` (Sonnet). Architecture, hard bugs and security work start at `deep-worker` (Opus).
 2. **Run the worker** as a subagent. The Agent `description` starts with a type tag such as `[bugfix]`, `[feature]`, `[docs]`, `[refactor]`, `[test]` or `[research]`.

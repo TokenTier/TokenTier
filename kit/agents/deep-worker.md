@@ -1,6 +1,6 @@
 ---
 name: deep-worker
-description: Top-tier worker (Opus). Use for hard tasks: architecture, tricky debugging, security-sensitive changes, large refactors, or when cheaper workers have failed. Last step of the model-router skill.
+description: Top-tier worker (Opus). Use for hard tasks: architecture, tricky debugging, security-sensitive changes, large refactors, or when cheaper workers have failed. Last step of the tokentier-router skill.
 model: opus
 effort: high
 ---

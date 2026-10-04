@@ -14,12 +14,12 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from tt_helpers import BIN, IS_WINDOWS, POSIX_ONLY, ROOT, FakeHome, fixture, free_port, load_cli, snapshot
 
 cli = load_cli()
-LINE = "For non-trivial tasks, follow the model-router skill."
+LINE = "For non-trivial tasks, follow the tokentier-router skill."
 EVENTS = ("SessionStart", "SessionEnd", "SubagentStart", "SubagentStop", "Stop")
 
 
 def kit(name):
-    sub = "skills/model-router/SKILL.md" if name == "SKILL.md" else "agents/" + name
+    sub = "skills/tokentier-router/SKILL.md" if name == "SKILL.md" else "agents/" + name
     with open(os.path.join(ROOT, "kit", sub), "rb") as f:
         return f.read()
 
@@ -96,15 +96,15 @@ class RoundTripTest(SeedMixin, FakeHome):
         self.assertEqual({k: v for k, v in snapshot(self.home).items() if not k.startswith(".tokentier")}, before)
 
     def test_identical_preexisting_agents_left_alone(self):
-        for a in ("fast-worker.md", "mid-worker.md", "deep-worker.md"):
+        for a in ("fast-worker.md", "mid-worker.md", "deep-worker.md", "deep-worker-low.md"):
             self.write(os.path.join(self.claude, "agents", a), kit(a))
-        self.write(os.path.join(self.claude, "skills", "model-router", "SKILL.md"), kit("SKILL.md"))
+        self.write(os.path.join(self.claude, "skills", "tokentier-router", "SKILL.md"), kit("SKILL.md"))
         self.install("--no-service")
         m = self.manifest()
         self.assertTrue(all(r.get("preexisting") for r in m["global"]["files"].values()))
         self.assertEqual(m["backups"], [])
         self.uninstall()
-        for a in ("fast-worker.md", "mid-worker.md", "deep-worker.md"):
+        for a in ("fast-worker.md", "mid-worker.md", "deep-worker.md", "deep-worker-low.md"):
             self.assertEqual(self.read(os.path.join(self.claude, "agents", a)), kit(a))
 
     def test_upgrade_of_preexisting_identical_agent_restores_original(self):
@@ -252,7 +252,7 @@ class InstallTest(SeedMixin, FakeHome):
         self.assertEqual(snapshot(self.home), before)
 
     def test_preexisting_snippet_line(self):
-        md = b"# Notes\n\nFor non-trivial tasks, follow the model-router skill.\n\nMore.\n"
+        md = b"# Notes\n\nFor non-trivial tasks, follow the tokentier-router skill.\n\nMore.\n"
         self.seed(None, md)
         self.install("--no-service")
         self.assertEqual(self.read(os.path.join(self.claude, "CLAUDE.md")), md)
@@ -382,7 +382,7 @@ class InstallTest(SeedMixin, FakeHome):
         if not IS_WINDOWS:
             self.assertTrue(os.access(os.path.join(self.tt, "app", "bin", "tokentier"), os.X_OK))
         g = m["global"]
-        self.assertEqual(len(g["files"]), 4)
+        self.assertEqual(len(g["files"]), 5)
         for path, r in g["files"].items():
             self.assertEqual(cli.sha256_file(path), r["sha256"])
             self.assertTrue(r["created"])

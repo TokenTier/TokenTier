@@ -1,6 +1,6 @@
 ---
 name: fast-worker
-description: Cheap first-pass worker (Haiku). Use for simple, well-defined tasks: small edits, renames, formatting, boilerplate, lookups, summaries. Called first by the model-router skill.
+description: Cheap first-pass worker (Haiku). Use for simple, well-defined tasks: small edits, renames, formatting, boilerplate, lookups, summaries. Called first by the tokentier-router skill.
 model: haiku
 ---
 

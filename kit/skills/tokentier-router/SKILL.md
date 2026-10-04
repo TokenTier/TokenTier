@@ -1,5 +1,5 @@
 ---
-name: model-router
+name: tokentier-router
 description: Cascade routing to save tokens. Use for any non-trivial coding or writing task the user hands off. Starts with the cheapest suitable worker (Haiku), verifies the result, and escalates to Sonnet then Opus only if the check fails.
 ---
 
@@ -52,4 +52,4 @@ Tell the user: which tier finished the task, how many escalations happened, and 
 
 ## Effort tuning (goat mode)
 
-Effort is tied to the worker: fast-worker has no effort setting, mid-worker uses medium, deep-worker uses high. For finer control, create extra agent files such as `deep-worker-low` (opus, effort low) and route to them for simple but high-stakes tasks, like a one-line change in a critical file.
+Effort is tied to the worker: fast-worker has no effort setting, mid-worker uses medium, deep-worker uses high. For simple but high-stakes tasks, such as a one-line change in a critical file, use `deep-worker-low` (Opus, low effort) — it is installed alongside the other workers.

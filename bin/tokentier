@@ -66,12 +66,12 @@ ROOT = os.path.dirname(os.path.dirname(SELF))
 MANIFEST_NAME = "install-manifest.json"
 MARK_START = "<!-- tokentier:start -->"
 MARK_END = "<!-- tokentier:end -->"
-DEFAULT_SNIPPET = "For non-trivial tasks, follow the model-router skill."
+DEFAULT_SNIPPET = "For non-trivial tasks, follow the tokentier-router skill."
 HOOK_EVENTS = ("SessionStart", "SessionEnd", "SubagentStart", "SubagentStop", "Stop")
 NO_MATCHER_EVENTS = ("Stop",)  # Claude Code ignores matchers on these events; the entry carries none
 HOOK_MARK = "tokentier_log.py"
 HOOK_TIMEOUT = 10
-AGENT_FILES = ("fast-worker.md", "mid-worker.md", "deep-worker.md")
+AGENT_FILES = ("fast-worker.md", "mid-worker.md", "deep-worker.md", "deep-worker-low.md")
 LAUNCHD_LABEL = "dev.tokentier.dashboard"
 SYSTEMD_UNIT = "tokentier-dashboard.service"
 DEFAULT_PORT = 8899
@@ -323,7 +323,7 @@ class Source(object):
 
     def check(self):
         need = [self.hook, os.path.join(self.dashboard, "server.py"),
-                os.path.join(self.kit, "skills", "model-router", "SKILL.md")]
+                os.path.join(self.kit, "skills", "tokentier-router", "SKILL.md")]
         need += [os.path.join(self.kit, "agents", a) for a in AGENT_FILES]
         missing = [p for p in need if not os.path.isfile(p)]
         if missing:
@@ -338,7 +338,7 @@ class Source(object):
         return read_bytes(os.path.join(self.kit, "agents", name))
 
     def skill(self):
-        return read_bytes(os.path.join(self.kit, "skills", "model-router", "SKILL.md"))
+        return read_bytes(os.path.join(self.kit, "skills", "tokentier-router", "SKILL.md"))
 
     def app_files(self):
         """[(relpath inside app dir, absolute source path)] in a stable order."""
@@ -1609,12 +1609,12 @@ def cmd_install(args):
         m["global"] = rec
     rec["claude_dir"] = claude_dir
     for d in (claude_dir, os.path.join(claude_dir, "agents"), os.path.join(claude_dir, "skills"),
-              os.path.join(claude_dir, "skills", "model-router")):
+              os.path.join(claude_dir, "skills", "tokentier-router")):
         plan_mkdir(plan, d, rec["created_dirs"])
     for name in AGENT_FILES:
         plan_kit_file(plan, os.path.join(claude_dir, "agents", name), src.agent(name), rec["files"],
                       "agent")
-    plan_kit_file(plan, os.path.join(claude_dir, "skills", "model-router", "SKILL.md"), src.skill(),
+    plan_kit_file(plan, os.path.join(claude_dir, "skills", "tokentier-router", "SKILL.md"), src.skill(),
                   rec["files"], "skill")
     plan_claude_md(plan, md_path, src.snippet(), rec["claude_md"])
 
@@ -2267,8 +2267,8 @@ def cmd_doctor(args):
                 mm = re.search(rb"^name:\s*(\S+)", b, re.M)
                 if mm:
                     names.append(mm.group(1).decode())
-            d.add("PASS" if len(names) == 3 else "FAIL", label + " agents",
-                  "visible to Claude Code: %s (+ model-router skill)" % ", ".join(names),
+            d.add("PASS" if len(names) == len(AGENT_FILES) else "FAIL", label + " agents",
+                  "visible to Claude Code: %s (+ tokentier-router skill)" % ", ".join(names),
                   "re-run install")
         cm = rec.get("claude_md") or {}
         mdp = cm.get("path")
@@ -3084,7 +3084,7 @@ def build_parser():
     p.add_argument("--days", type=int, default=30, help="look back this many days (default 30)")
     p.add_argument("--json", action="store_true", help="print JSON instead of a table")
     p.add_argument("--write-hints", action="store_true",
-                   help="write <home>/routing-hints.json for the model-router skill")
+                   help="write <home>/routing-hints.json for the tokentier-router skill")
     p = sub.add_parser("config", help="show or change $TOKENTIER_HOME/config.json",
                        description="Read and edit config.json. Keys: %s. Precedence: CLI flag > "
                        "environment variable > config.json > built-in default. Exit codes: 0 ok, "

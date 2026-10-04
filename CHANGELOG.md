@@ -161,7 +161,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `bin/tokentier` CLI (Python 3.9+, stdlib only) with `install`, `uninstall`, `status`, `doctor`,
   `dashboard`, `open`, `migrate legacy` and `version`.
 - Installer: copies the app to `~/.tokentier/app/` so the repo can be deleted afterwards; installs the agents and the
-  `model-router` skill (backing up any different existing files); adds the router line to `CLAUDE.md` between
+  `tokentier-router` skill (backing up any different existing files); adds the router line to `CLAUDE.md` between
   `<!-- tokentier:start/end -->` markers, or records that it was already there; merges four logging hooks into
   `settings.json` (atomic write, backup first, existing keys/hooks untouched, aborts on invalid JSON); `--dry-run`
   with unified diffs, `--yes`, `--project [DIR]` (repeatable), `--no-service`, `--no-hooks`, `--port`,
@@ -181,7 +181,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tokentier stats [--days N] [--json] [--write-hints]`: per task-type routing stats (attempts and pass rate per
   tier, escalation rate, average cost using `dashboard/pricing.json`) and a recommended start tier; `--write-hints`
   writes `~/.tokentier/routing-hints.json` atomically.
-- `model-router` skill: type tags (`[bugfix]`, `[feature]`, ...) in the Agent description, optional use of
+- `tokentier-router` skill: type tags (`[bugfix]`, `[feature]`, ...) in the Agent description, optional use of
   `routing-hints.json` (only to start higher than the default table), and escalation reasons passed to the next tier.
 - Opt-in extra `kit/extras/agents/deep-worker-low.md` (Opus, low effort), not installed by default.
 - CI (`.github/workflows/ci.yml`: unit tests, shellcheck, `node --check`; Ubuntu and macOS, Python 3.9/3.11/3.12),

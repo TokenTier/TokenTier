@@ -1,1 +1,1 @@
-For non-trivial tasks, follow the model-router skill.
+For non-trivial tasks, follow the tokentier-router skill.
