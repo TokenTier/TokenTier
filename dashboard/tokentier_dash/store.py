@@ -673,7 +673,7 @@ class Store(object):
                 for k in ("input", "output", "cache_creation", "cache_read"):
                     tot["tokens"][k] += v["tokens"][k]
                 tot["tokens"]["total"] += v["tokens_total"]
-                tk = self.pricing.base_tier(v["tier"], pdata)
+                tk = self.pricing.base_tier(v["tier"])
                 bt = by_tier[tk]
                 bt["tasks"] += 1
                 bt["tokens"] += v["tokens_total"]
