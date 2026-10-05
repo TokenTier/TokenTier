@@ -387,7 +387,7 @@ class PricingConfigTest(ServerBase):
             f.write("nope")
         j(os.path.join(self.home, "config.json"), {"pricing_path": user})
         self.serve()
-        self.assertEqual(sorted(self.get("/api/pricing")["models"]), ["haiku", "opus", "sonnet"])
+        self.assertEqual(sorted(self.get("/api/pricing")["models"]), ["haiku", "opus", "opus-4", "sonnet", "sonnet-4"])
         self.assertEqual(len(self.get("/api/health")["warnings"]), 1)
 
     def test_config_warnings_in_health(self):

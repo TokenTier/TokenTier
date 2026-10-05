@@ -5,15 +5,21 @@ import os
 import threading
 
 DEFAULT = {
-    "updated": "2026-10-04",
+    "updated": "2026-10-05",
     "source": "built-in defaults",
     "models": {
         "haiku": {"match": ["claude-haiku-4-5"], "label": "Haiku 4.5", "input": 1.00, "output": 5.00,
                   "cache_write": 1.25, "cache_read": 0.10},
         "sonnet": {"match": ["claude-sonnet-5-5"], "label": "Sonnet 5.5", "input": 2.00, "output": 10.00,
                    "cache_write": 2.50, "cache_read": 0.20},
+        "sonnet-4": {"match": ["claude-sonnet-4-6", "claude-sonnet-4"], "label": "Sonnet 4.6",
+                     "tier": "sonnet", "input": 3.00, "output": 15.00,
+                     "cache_write": 3.75, "cache_read": 0.30},
         "opus": {"match": ["claude-opus-5-5"], "label": "Opus 5.5", "input": 4.00, "output": 20.00,
                  "cache_write": 5.00, "cache_read": 0.20},
+        "opus-4": {"match": ["claude-opus-4", "claude-opus-4-5"], "label": "Opus 4",
+                   "tier": "opus", "input": 15.00, "output": 75.00,
+                   "cache_write": 18.75, "cache_read": 1.50},
     },
     "baseline_tier": "opus",
     "baseline_token_multiplier": 1.0,
@@ -152,11 +158,11 @@ class Pricing(object):
         return None
 
     def base_tier(self, key, data=None):
-        """Canonical tier bucket (haiku/sonnet/opus/lead) for a pricing key.
+        """Canonical tier bucket (haiku/sonnet/opus) for a pricing key, or 'unknown'.
 
         Sub-tier entries (e.g. 'sonnet-4') declare their bucket via a 'tier' field.
-        Falls back to the key itself when it is already a base tier, else 'unknown'."""
-        _BASE = ("haiku", "sonnet", "opus", "lead")
+        'lead' is not a bucket here — lead usage is aggregated separately."""
+        _BASE = ("haiku", "sonnet", "opus")
         if not key:
             return "unknown"
         if key in _BASE:
