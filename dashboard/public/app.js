@@ -365,7 +365,10 @@
   });
 
   // ------------------------------------------------------------------ small components
-  function tierKey(t) { return t === 'haiku' || t === 'sonnet' || t === 'opus' ? t : 'other'; }
+  function tierKey(t) {
+    var base = t && D.pricing && D.pricing.models && D.pricing.models[t] && D.pricing.models[t].tier || t;
+    return base === 'haiku' || base === 'sonnet' || base === 'opus' ? base : 'other';
+  }
   function tierLabel(key) {
     var m = D.pricing && D.pricing.models && D.pricing.models[key];
     return (m && m.label) || (key ? cap(key) : DASH);

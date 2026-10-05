@@ -151,6 +151,21 @@ class Pricing(object):
             return t
         return None
 
+    def base_tier(self, key, data=None):
+        """Canonical tier bucket (haiku/sonnet/opus/lead) for a pricing key.
+
+        Sub-tier entries (e.g. 'sonnet-4') declare their bucket via a 'tier' field.
+        Falls back to the key itself when it is already a base tier, else 'unknown'."""
+        _BASE = ("haiku", "sonnet", "opus", "lead")
+        if not key:
+            return "unknown"
+        if key in _BASE:
+            return key
+        data = data or self.current()
+        spec = data.get("models", {}).get(key, {})
+        t = spec.get("tier", "")
+        return t if t in _BASE else "unknown"
+
     @staticmethod
     def _price(tokens, spec):
         parts = {
